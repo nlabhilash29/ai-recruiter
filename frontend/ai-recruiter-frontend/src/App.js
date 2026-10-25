@@ -6,27 +6,24 @@ import IntroAnimation from "./components/IntroAnimation";
 import ParticlesBackground from "./ParticlesBackground";
 import HomePage from "./pages/HomePage";
 import InterviewPage from "./pages/InterviewPage";
+import LandingPage from "./pages/LandingPage";
 import PracticeResultsPage from "./pages/PracticeResultsPage";
 import RecruiterPage from "./pages/RecruiterPage";
 import ReportPage from "./pages/ReportPage";
 
 function Shell({ variant, children }) {
   const location = useLocation();
-  const recruiterOn = location.pathname === "/" || location.pathname.startsWith("/recruiter");
+  const recruiterOn = location.pathname === "/recruiter" || location.pathname.startsWith("/recruiter/");
   const candidateOn = location.pathname.startsWith("/candidate");
   return (
     <div className="app-shell">
       <header className="topbar">
-        {variant === "candidate" ? (
-          <span className="brand">AI Recruiter</span>
-        ) : (
-          <Link className="brand" to="/">
-            AI Recruiter
-          </Link>
-        )}
+        <Link className="brand" to="/">
+          AI Recruiter
+        </Link>
         {variant === "app" && (
           <nav className="nav" aria-label="Primary">
-            <Link to="/" aria-current={recruiterOn ? "page" : undefined}>
+            <Link to="/recruiter" aria-current={recruiterOn ? "page" : undefined}>
               Recruiter
             </Link>
             <Link to="/candidate" aria-current={candidateOn ? "page" : undefined}>
@@ -74,7 +71,7 @@ export default function App() {
               path="/"
               element={
                 <Shell variant="app">
-                  <RecruiterPage />
+                  <LandingPage />
                 </Shell>
               }
             />
