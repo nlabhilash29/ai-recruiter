@@ -5,6 +5,14 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+from rubric import (
+    DIMENSIONS,
+    clean_dimension_scores,
+    follow_up_reason,
+    next_dimension,
+    rubric_for,
+    weighted_overall,
+)
 from settings import GROQ_API_KEY, GROQ_MODEL, GROQ_REASONING_EFFORT, ai_stub_enabled
 
 load_dotenv()
@@ -62,6 +70,25 @@ ANALYSIS_RESPONSE_FORMAT = {
                 "key_points": {"type": "string"},
                 "improvement_areas": {"type": "string"},
                 "feedback": {"type": "string"},
+                "evidence": {"type": "string"},
+                "dimension_scores": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "problem_solving": {"type": "number"},
+                        "communication": {"type": "number"},
+                        "role_knowledge": {"type": "number"},
+                        "ownership": {"type": "number"},
+                        "collaboration": {"type": "number"},
+                    },
+                    "required": [
+                        "problem_solving",
+                        "communication",
+                        "role_knowledge",
+                        "ownership",
+                        "collaboration",
+                    ],
+                },
             },
             "required": [
                 "relevance_score",
@@ -70,6 +97,8 @@ ANALYSIS_RESPONSE_FORMAT = {
                 "key_points",
                 "improvement_areas",
                 "feedback",
+                "evidence",
+                "dimension_scores",
             ],
         },
     },
@@ -276,6 +305,8 @@ def _analysis_from_mapping(data: dict) -> Dict[str, Any]:
         "key_points": _meaningful(key_points),
         "improvement_areas": _meaningful(improvement),
         "feedback": _meaningful(feedback),
+        "evidence": _meaningful(data.get("evidence")),
+        "dimension_scores": data.get("dimension_scores") if isinstance(data.get("dimension_scores"), dict) else {},
     }
 
 
@@ -349,12 +380,20 @@ def finalize_analysis(analysis: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _stub_analysis() -> Dict[str, Any]:
-    return finalize_analysis(
+def _stub_analysis(role_family: str = "general") -> Dict[str, Any]:
+    scores = {
+        "problem_solving": 7.5,
+        "communication": 8.0,
+        "role_knowledge": 7.0,
+        "ownership": 7.0,
+        "collaboration": 6.5,
+    }
+    overall = weighted_overall(scores, role_family)
+    analysis = finalize_analysis(
         {
-            "relevance_score": 7.5,
-            "clarity_score": 8.0,
-            "technical_score": 7.0,
+            "relevance_score": overall if overall is not None else 7.2,
+            "clarity_score": scores["communication"],
+            "technical_score": scores["role_knowledge"],
             "key_points": "Described the work, their role, and how they approached it.",
             "improvement_areas": "Add a measurable result and one tradeoff you considered.",
             "feedback": (
@@ -363,18 +402,80 @@ def _stub_analysis() -> Dict[str, Any]:
             ),
         }
     )
+    analysis["dimension_scores"] = scores
+    analysis["evidence"] = "I led the work to build an AI interview product."
+    analysis["not_assessed"] = False
+    return analysis
 
 
-async def analyze_response(question: str, response: str) -> Dict[str, Any]:
+def _unscored_analysis() -> Dict[str, Any]:
+    analysis = finalize_analysis(
+        {
+            "relevance_score": 5,
+            "clarity_score": 5,
+            "technical_score": 5,
+            "key_points": "",
+            "improvement_areas": "Answer out loud with one specific example and the result.",
+            "feedback": "No speech was detected for this question, so it was not scored.",
+        }
+    )
+    analysis["relevance_score"] = None
+    analysis["clarity_score"] = None
+    analysis["technical_score"] = None
+    analysis["dimension_scores"] = {key: None for key in DIMENSIONS}
+    analysis["evidence"] = ""
+    analysis["not_assessed"] = True
+    return analysis
+
+
+def _attach_dimensions(analysis: Dict[str, Any], role_family: str) -> Dict[str, Any]:
+    scores = clean_dimension_scores(analysis.get("dimension_scores"))
+    if scores.get("communication") is None and analysis.get("clarity_score") is not None:
+        scores["communication"] = analysis.get("clarity_score")
+    if scores.get("role_knowledge") is None and analysis.get("technical_score") is not None:
+        scores["role_knowledge"] = analysis.get("technical_score")
+    if scores.get("problem_solving") is None and analysis.get("relevance_score") is not None:
+        scores["problem_solving"] = analysis.get("relevance_score")
+    if analysis.get("not_assessed"):
+        scores = {key: None for key in DIMENSIONS}
+    analysis["dimension_scores"] = scores
+    if not analysis.get("not_assessed"):
+        overall = weighted_overall(scores, role_family)
+        if overall is not None:
+            analysis["relevance_score"] = overall
+        analysis["clarity_score"] = scores.get("communication")
+        analysis["technical_score"] = scores.get("role_knowledge")
+    analysis["evidence"] = (analysis.get("evidence") or analysis.get("key_points") or "").strip()
+    return analysis
+
+
+async def analyze_response(
+    question: str,
+    response: str,
+    role_family: str = "general",
+    dimension: str | None = None,
+    no_speech: bool = False,
+) -> Dict[str, Any]:
     """Score an answer and always return feedback plus improvement text."""
+    if no_speech or not (response or "").strip() or response.strip().lower().startswith("the candidate did not speak"):
+        return _unscored_analysis()
     if ai_stub_enabled():
-        return _stub_analysis()
+        return _stub_analysis(role_family)
+    plan = rubric_for(role_family)
+    focus = dimension or "the dimension this question was meant to test"
     try:
-        prompt = f"""Analyze this interview response.
-Score relevance, clarity, and technical accuracy from 0 to 10.
-key_points, improvement_areas, and feedback must be specific and non-empty.
-feedback is 2-3 sentences on what worked and what to add.
-improvement_areas is concrete advice the candidate can apply next time.
+        prompt = f"""Score this interview answer against the rubric. Use only the transcript.
+If a dimension has no evidence in the answer, set it to null. Do not guess.
+Scores are 1 to 10. Anchors live at 2, 4, 6, 8, and 10.
+evidence is a short quote or close paraphrase from the answer that justifies the scores.
+feedback is 2-3 sentences on what worked and what to add, and must be non-empty.
+improvement_areas is concrete advice, and must be non-empty.
+relevance_score is the weighted overall of the dimensions you could score.
+clarity_score copies communication. technical_score copies role_knowledge.
+
+Role: {plan["role_label"]}
+Primary dimension for this question: {focus}
+Descriptors: {plan["descriptors"]}
 
 Question: {question}
 Response: {response}
@@ -421,18 +522,21 @@ Response: {response}
                     analysis["improvement_areas"] = retry.get("improvement_areas", "")
             except Exception as retry_error:
                 logger.error("Feedback retry failed: %s", retry_error)
-        return finalize_analysis(analysis)
+        return _attach_dimensions(finalize_analysis(analysis), role_family)
     except Exception as exc:
         logger.error("Error analyzing response: %s", exc)
-        return finalize_analysis(
-            {
-                "relevance_score": 5,
-                "clarity_score": 5,
-                "technical_score": 5,
-                "key_points": "",
-                "improvement_areas": "",
-                "feedback": "",
-            }
+        return _attach_dimensions(
+            finalize_analysis(
+                {
+                    "relevance_score": 5,
+                    "clarity_score": 5,
+                    "technical_score": 5,
+                    "key_points": "",
+                    "improvement_areas": "",
+                    "feedback": "",
+                }
+            ),
+            role_family,
         )
 
 
@@ -639,6 +743,105 @@ def get_default_questions() -> List[Dict[str, Any]]:
             "key_points": "Company research, technical knowledge, cultural values, motivation",
         },
     ]
+
+
+def _fallback_follow_up(reason: str) -> str:
+    if reason == "thin":
+        return "Could you give one specific example, including what you personally did and what resulted?"
+    return "What tradeoff did you weigh there, and how did you choose?"
+
+
+async def maybe_follow_up_question(question: str, answer: str, analysis: Dict[str, Any]) -> Optional[str]:
+    """Return one follow-up, or None. Callers allow at most one per main question."""
+    reason = follow_up_reason(answer, analysis)
+    if not reason:
+        return None
+    if ai_stub_enabled() or not GROQ_API_KEY:
+        return _fallback_follow_up(reason)
+    try:
+        raw = complete_chat(
+            [
+                {
+                    "role": "system",
+                    "content": "You ask one short follow-up interview question. Return only the question.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"The answer was {reason}. Ask one follow-up that stays on the same topic.\n"
+                        f"Question: {question}\nAnswer: {answer}"
+                    ),
+                },
+            ],
+            max_completion_tokens=200,
+            temperature=0.4,
+        )
+        text = (raw or "").strip().strip('"')
+        return text if text.endswith("?") else _fallback_follow_up(reason)
+    except Exception as exc:
+        logger.error("Follow-up generation failed: %s", exc)
+        return _fallback_follow_up(reason)
+
+
+async def generate_next_main_question(
+    jd_content: str,
+    resume_content: str,
+    history: List[Dict[str, str]],
+    main_index: int,
+    role_family: str,
+    covered: List[str],
+) -> Dict[str, Any]:
+    """One main question, chosen from the job, the resume, and answers so far."""
+    dimension = next_dimension(role_family, covered, main_index)
+    plan = rubric_for(role_family)
+    if ai_stub_enabled() or not GROQ_API_KEY:
+        base = get_default_questions()[(main_index - 1) % 5]
+        return {
+            **base,
+            "dimension": dimension,
+            "question_type": dimension,
+            "main_index": main_index,
+        }
+    prior = "\n".join(
+        f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}" for item in history
+    ) or "No answers yet."
+    try:
+        raw = complete_chat(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You write one interview question. Return JSON with question_text, "
+                        "question_type, assesses, and key_points."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Role family: {plan['role_label']}.\n"
+                        f"This question should probe {dimension}: {plan['descriptors'][dimension]}\n"
+                        f"Do not repeat a question already asked.\n\n"
+                        f"Job description:\n{jd_content[:4000]}\n\n"
+                        f"Resume:\n{resume_content[:4000]}\n\n"
+                        f"So far:\n{prior}"
+                    ),
+                },
+            ],
+            max_completion_tokens=700,
+            temperature=0.5,
+            response_format=QUESTION_RESPONSE_FORMAT,
+        )
+        payload = _try_json(raw) or {}
+        questions = _questions_from_payload(payload) or parse_generated_questions(raw)
+        chosen = questions[0] if questions else get_default_questions()[(main_index - 1) % 5]
+    except Exception as exc:
+        logger.error("Next question generation failed: %s", exc)
+        chosen = get_default_questions()[(main_index - 1) % 5]
+    chosen = dict(chosen)
+    chosen["dimension"] = dimension
+    chosen["question_type"] = dimension
+    chosen["main_index"] = main_index
+    return chosen
 
 
 def parse_generated_questions(text: str) -> List[Dict[str, Any]]:

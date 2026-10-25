@@ -1,8 +1,8 @@
-"""Shared recruiter passcode.
+"""Optional shared recruiter passcode.
 
-The browser keeps a signed token. The server stores nothing: each request
-recomputes the HMAC with ``RECRUITER_PASSCODE``. When that variable is unset,
-recruiter routes refuse access instead of falling open.
+Recruiter routes are open unless ``RECRUITER_AUTH_REQUIRED`` is true.
+``RECRUITER_PASSCODE`` by itself does not lock the app. When the flag is on,
+the browser keeps a signed token and each request recomputes the HMAC.
 """
 
 import base64
@@ -17,6 +17,14 @@ TOKEN_TTL_SECONDS = 12 * 60 * 60
 UNCONFIGURED_DETAIL = (
     "Recruiter access is not configured. Set RECRUITER_PASSCODE on the server."
 )
+
+
+def _flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def recruiter_auth_required() -> bool:
+    return _flag("RECRUITER_AUTH_REQUIRED")
 
 
 def recruiter_passcode() -> str:
@@ -48,6 +56,8 @@ def token_is_valid(token: str, passcode: str, now: int | None = None) -> bool:
 
 
 def require_recruiter(authorization: str | None = Header(default=None)) -> None:
+    if not recruiter_auth_required():
+        return
     passcode = recruiter_passcode()
     if not passcode:
         raise HTTPException(status_code=503, detail=UNCONFIGURED_DETAIL)

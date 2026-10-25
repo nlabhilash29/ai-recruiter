@@ -318,3 +318,66 @@ textarea { min-height: 96px; resize: vertical; }
 .editor { margin-bottom: 12px; }
 .editor-head { justify-content: space-between; }
 .ready-card .btn { margin-top: 8px; }
+
+.choice-set {
+  border: 0;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.choice-set legend {
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 650;
+}
+
+.choice input {
+  width: auto;
+  margin: 0;
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 0 12px;
+  font-weight: 700;
+}
+
+.countdown {
+  margin: 8px 0;
+  color: var(--blue-deep);
+  font-weight: 700;
+}
+
+.fallback-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 8px 0 0;
+}
+
+.text-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--blue-deep);
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+  min-height: 44px;
+}
+
+.weight {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.anchors { margin-top: 12px; }
+.anchors summary { cursor: pointer; font-weight: 650; }
