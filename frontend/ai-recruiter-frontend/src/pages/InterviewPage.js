@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import axios from "axios";
 import Webcam from "react-webcam";
 import { API_URL, candidateLink, friendlyError } from "../api";
+import ColdStart from "../components/ColdStart";
 import CopyButton from "../components/CopyButton";
 import { calibrateThreshold, createVadController, levelPercent, MAX_ANSWER_MS } from "../vad";
 
@@ -434,9 +435,9 @@ export default function InterviewPage() {
         </div>
       </div>
 
-      {error ? <div className="alert alert-error">{error}</div> : null}
+      <ColdStart active={phase === "loading"} />
 
-      {phase === "loading" && <p className="card">Opening the interview…</p>}
+      {error ? <div className="alert alert-error">{error}</div> : null}
 
       {phase === "unavailable" && (
         <section className="card">
@@ -473,7 +474,7 @@ export default function InterviewPage() {
           </button>
           {!session?.is_mock ? (
             <p className="fallback-row">
-              <Link className="text-link" to="/#practice">
+              <Link className="text-link" to="/candidate#practice">
                 Want to warm up first?
               </Link>
             </p>

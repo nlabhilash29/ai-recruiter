@@ -25,7 +25,7 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 **Candidate interview**
 
-- The Interview tab offers two choices: paste a recruiter link, or practice. Practice is a 5-question sample and is not shared. A direct `/interview/:id` link skips that page.
+- The Candidate tab is a single stacked page: paste an interview link and start, or open “Do you want to practice first? Click here.” Practice asks for a job description and a resume, then runs a 5-question sample. A direct `/interview/:id` link skips that page.
 - Deep links stay at `/interview/:id`.
 - Microphone and camera check, including a short room-noise calibration. Only audio is recorded and transcribed. The camera is a framing preview and is not uploaded.
 - One **Begin interview** click unlocks audio. After that there are no Start, Stop, Re-record, or Submit buttons. The interviewer speaks, then listens. About 2.8 seconds of silence after speech ends the answer. A live microphone level, "Listening…", and "Moving on in 2…" keep the state obvious. Resumed speech cancels the countdown.
@@ -34,7 +34,7 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 **Recruiter area**
 
-- Two tabs only: Interview and Recruiter. The recruiter page creates an interview from a job description and a resume, then shows an interview link to copy. It does not start the interview.
+- Two tabs only, in this order: Recruiter (the default) and Candidate. The recruiter page pastes a job description and a resume, then shows an interview link to copy. It does not start the interview, and it does not wait on the access check before rendering. Questions are generated only when both documents are present.
 - Open by default. Set `RECRUITER_AUTH_REQUIRED=true` to require `RECRUITER_PASSCODE`. The passcode alone does not lock the desk.
 - **View candidate reports** lists interviews with search and a status filter.
 - The role used for rubric weights is inferred from the job description and resume. There is no role picker and no question-count or preset-question control.
@@ -51,10 +51,11 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 ```
 Browser (Vercel)
-  /                         Interview tab: open a link, or practice
-  /interview/:id            hands-free candidate interview
+  /                         Recruiter tab: paste a job description and resume, copy the link
+  /candidate                Candidate tab: start from a link, or practice
+  /interview/:id            hands-free interview from a recruiter link
   /interview/:id/results    score report
-  /recruiter                create interviews, copy links, list
+  /recruiter                same recruiter desk
   /recruiter/interviews/:id recruiter report
         |
         |  HTTPS, REACT_APP_API_URL
@@ -170,7 +171,7 @@ This fork is the work in [nlabhilash29/ai-recruiter](https://github.com/nlabhila
 
 - **Deployment fixes.** The API boots without every provider key and names the missing one with HTTP 503. Recordings are sent to Whisper in their real format. Question edits no longer write a column that does not exist. Retired Groq and ElevenLabs model ids are not the defaults. A clean frontend install no longer depends on `react-mic`.
 - **Feedback reliability.** Scores and feedback survive multiline labels, markdown headings, and JSON. Empty feedback is retried, then filled with a short fallback, and improvement notes are stored and shown.
-- **Candidate and recruiter separation.** Candidates use `/interview/:id`. Recruiters use `/recruiter` to create interviews, copy a candidate link, and open results. The desk is open unless `RECRUITER_AUTH_REQUIRED=true`.
+- **Recruiter and Candidate tabs.** The Recruiter tab is the default. The Candidate tab pastes an interview link or practices. A sent link still opens `/interview/:id`. The desk is open unless `RECRUITER_AUTH_REQUIRED=true`.
 - **Hands-free interviews.** Five AI-generated questions, browser voice detection, and a five-dimension rubric. The role weight is inferred from the job description and resume.
 - **Results redesign.** Summary card, score bars, per-question evidence, and a plain explanation of how the score was built. Older technical / communication / cultural-fit rows still render.
 - **UX and accessibility.** Cold-start copy, device check, spoken questions, visible listening state, copy-link buttons, visible focus, labelled inputs, and `prefers-reduced-motion`.

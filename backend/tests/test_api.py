@@ -199,9 +199,18 @@ class RecruiterDocumentFlowTests(unittest.TestCase):
         self.assertTrue(any(item["interview_id"] == interview_id for item in found.json()))
 
 
+def practice_documents(**overrides):
+    data = {
+        "jd_text": "Job Title: Frontend Engineer\nCompany: Example\nBuild user interfaces.",
+        "resume_text": "Alex Rivera\nalex@example.com\nFrontend engineer who ships UI.",
+    }
+    data.update(overrides)
+    return data
+
+
 class InterviewLoopTests(unittest.TestCase):
     def test_mock_interview_scores_each_answer_without_provider_keys(self):
-        created = client.post("/mock-interview", data={"job_role": "Frontend Engineer"})
+        created = client.post("/mock-interview", data=practice_documents())
         self.assertEqual(created.status_code, 200, created.text)
         interview_id = created.json()["interview_id"]
         self.assertEqual(created.json()["question_mode"], "dynamic")
@@ -242,7 +251,12 @@ class InterviewLoopTests(unittest.TestCase):
     def test_no_speech_moves_on_without_a_score(self):
         created = client.post(
             "/mock-interview",
-            data={"job_role": "Product Manager", "main_question_target": "3", "role_family": "product_manager"},
+            data=practice_documents(
+                jd_text="Job Title: Product Manager\nPrioritize the roadmap and talk to customers.",
+                resume_text="I led a checkout rewrite with design and engineering.",
+                main_question_target="3",
+                role_family="product_manager",
+            ),
         )
         self.assertEqual(created.status_code, 200, created.text)
         interview_id = created.json()["interview_id"]
@@ -282,11 +296,49 @@ class InterviewLoopTests(unittest.TestCase):
         self.assertEqual(len(created.json()["questions"]), 1)
         self.assertEqual(len(created.json()["evaluation"]), 5)
 
+    def test_practice_and_create_require_both_documents(self):
+        role_only = client.post("/mock-interview", data={"job_role": "Frontend Engineer"})
+        self.assertEqual(role_only.status_code, 400)
+        self.assertIn("resume", role_only.json()["detail"].lower())
+        self.assertIn("job description", role_only.json()["detail"].lower())
+
+        resume_only = client.post("/mock-interview", data={"resume_text": "I shipped a product."})
+        self.assertEqual(resume_only.status_code, 400)
+
+        headers = auth_headers()
+        missing = client.post(
+            "/interview/create",
+            headers=headers,
+            data={"jd_text": "Build reliable APIs for the billing team."},
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn("resume", missing.json()["detail"].lower())
+
+        created = client.post(
+            "/interview/create",
+            headers=headers,
+            data={
+                "jd_text": "Job Title: Backend Engineer\nCompany: Example Corp\nBuild reliable APIs.",
+                "resume_text": "Jane Doe\njane@example.com\nBackend engineer who ships APIs.",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["question_mode"], "dynamic")
+        self.assertEqual(created.json()["main_question_target"], 5)
+        self.assertEqual(created.json()["candidate_name"], "Jane Doe")
+        self.assertEqual(created.json()["job_title"], "Backend Engineer")
+
     def test_video_requires_openai_key_when_stub_is_off(self):
         previous = os.environ.get("AI_STUB")
         os.environ["AI_STUB"] = "0"
         try:
-            created = client.post("/mock-interview", data={"job_role": "Data Analyst"})
+            created = client.post(
+                "/mock-interview",
+                data=practice_documents(
+                    jd_text="Job Title: Data Analyst\nMeasure product usage.",
+                    resume_text="Sam Lee\nsam@example.com\nData analyst.",
+                ),
+            )
             self.assertEqual(created.status_code, 200, created.text)
             response = client.post(
                 "/talk-video",

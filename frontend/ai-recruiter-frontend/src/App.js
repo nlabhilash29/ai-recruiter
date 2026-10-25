@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { BrowserRouter, Link, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Link, Route, Routes, useLocation } from "react-router-dom";
 import { prefersReducedMotion } from "./api";
-import ColdStart from "./components/ColdStart";
+import { MissingApiNotice } from "./components/ColdStart";
 import IntroAnimation from "./components/IntroAnimation";
 import ParticlesBackground from "./ParticlesBackground";
 import HomePage from "./pages/HomePage";
@@ -11,6 +11,9 @@ import RecruiterPage from "./pages/RecruiterPage";
 import ReportPage from "./pages/ReportPage";
 
 function Shell({ variant, children }) {
+  const location = useLocation();
+  const recruiterOn = location.pathname === "/" || location.pathname.startsWith("/recruiter");
+  const candidateOn = location.pathname.startsWith("/candidate");
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -23,8 +26,12 @@ function Shell({ variant, children }) {
         )}
         {variant === "app" && (
           <nav className="nav" aria-label="Primary">
-            <Link to="/">Interview</Link>
-            <Link to="/recruiter">Recruiter</Link>
+            <Link to="/" aria-current={recruiterOn ? "page" : undefined}>
+              Recruiter
+            </Link>
+            <Link to="/candidate" aria-current={candidateOn ? "page" : undefined}>
+              Candidate
+            </Link>
           </nav>
         )}
         <a
@@ -49,13 +56,14 @@ export default function App() {
   const skipIntro =
     process.env.NODE_ENV === "test" ||
     prefersReducedMotion() ||
-    path.startsWith("/interview") ||
-    path.startsWith("/recruiter");
+    path === "/" ||
+    path.startsWith("/recruiter") ||
+    path.startsWith("/interview");
   const [showIntro, setShowIntro] = useState(!skipIntro);
 
   return (
     <>
-      <ColdStart />
+      <MissingApiNotice />
       {showIntro ? (
         <IntroAnimation onComplete={() => setShowIntro(false)} />
       ) : (
@@ -66,7 +74,7 @@ export default function App() {
               path="/"
               element={
                 <Shell variant="app">
-                  <HomePage />
+                  <RecruiterPage />
                 </Shell>
               }
             />
@@ -75,6 +83,14 @@ export default function App() {
               element={
                 <Shell variant="app">
                   <RecruiterPage />
+                </Shell>
+              }
+            />
+            <Route
+              path="/candidate"
+              element={
+                <Shell variant="app">
+                  <HomePage />
                 </Shell>
               }
             />
