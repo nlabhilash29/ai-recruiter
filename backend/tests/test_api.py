@@ -98,10 +98,10 @@ class ProviderConfigurationTests(unittest.TestCase):
         self.assertEqual(analysis["feedback"], "Clear example")
 
     def test_root_and_cors_do_not_require_credentials(self):
-        response = client.get("/", headers={"Origin": "https://ai-recruiter-tau.vercel.app"})
+        response = client.get("/", headers={"Origin": "https://ai-recruiter-one-sigma.vercel.app"})
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["message"])
-        self.assertEqual(response.headers["access-control-allow-origin"], "https://ai-recruiter-tau.vercel.app")
+        self.assertEqual(response.headers["access-control-allow-origin"], "https://ai-recruiter-one-sigma.vercel.app")
         self.assertNotEqual(response.headers.get("access-control-allow-credentials"), "true")
 
 

@@ -2,6 +2,11 @@
   "name": "ai-recruiter-frontend",
   "version": "0.1.0",
   "private": true,
+  "author": "Abhilash N L (https://github.com/nlabhilash29)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nlabhilash29/ai-recruiter.git"
+  },
   "dependencies": {
     "@testing-library/jest-dom": "^5.17.0",
     "@testing-library/react": "^13.4.0",
