@@ -1,8 +1,7 @@
 import React, { useState } from 'react';
 import axios from 'axios';
 import './MockInterview.css';
-
-const API_URL = process.env.REACT_APP_API_URL;
+import { API_URL, apiErrorMessage } from './api';
 
 function MockInterview() {
   const [jobRole, setJobRole] = useState('');
@@ -37,7 +36,7 @@ function MockInterview() {
       setSuccess('Mock interview created successfully! Use the ID to start the interview.');
     } catch (error) {
       console.error('Error creating mock interview:', error.response || error);
-      setError('Failed to create mock interview: ' + (error.response?.data?.detail || error.message));
+      setError('Failed to create mock interview: ' + apiErrorMessage(error, 'Request failed'));
     } finally {
       setIsLoading(false);
     }
@@ -76,6 +75,13 @@ function MockInterview() {
           <h3>Mock Interview Created</h3>
           <p>Interview ID: <strong>{interviewId}</strong></p>
           <p>Use this ID in the Video Interview tab to start the interview.</p>
+          {questions.length > 0 && (
+            <ol className="question-preview">
+              {questions.map((question, index) => (
+                <li key={question.id || index}>{question.question_text}</li>
+              ))}
+            </ol>
+          )}
         </div>
       )}
     </div>

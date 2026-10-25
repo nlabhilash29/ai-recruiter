@@ -121,64 +121,72 @@ Responds to candidates with audio feedback using ElevenLabs API.
 ### Prerequisites
 
 1. Node.js and npm (for the frontend).
-2. Python 3.8+ (for the backend).
-3. Environment Variables:
-- DATABASE_URL: Database connection string (default: SQLite).
-- OPENAI_API_KEY: OpenAI API key for transcription and question generation.
-- GROQ_API_KEY: API key for LLM-based question generation.
-- ELEVENLABS_API_KEY: ElevenLabs API key for text-to-speech functionality.
+2. Python 3.9+ (for the backend).
+3. Environment variables. The API starts without them. Routes that call a provider return HTTP 503 naming the missing variable. Set `AI_STUB=1` only for a local demo that skips those providers.
+
+| Variable | Where | Required for | Default |
+| --- | --- | --- | --- |
+| `REACT_APP_API_URL` | Frontend build (Vercel) | Browser calls to the API. Create React App inlines this at build time, so changing it requires a new deploy. | `http://localhost:8000` |
+| `OPENAI_API_KEY` | Backend host | Whisper transcription (`whisper-1`) | none |
+| `GROQ_API_KEY` | Backend host | Question generation, mock job descriptions, and scoring | none; built-in questions are used when it is missing |
+| `GROQ_MODEL` | Backend host | Groq model id | `openai/gpt-oss-120b` |
+| `GROQ_REASONING_EFFORT` | Backend host | Optional reasoning budget (`low`, `medium`, `high`, or empty to omit) | `low` |
+| `ELEVENLABS_API_KEY` | Backend host | Spoken interviewer prompts | none |
+| `ELEVENLABS_MODEL_ID` | Backend host | ElevenLabs model | `eleven_flash_v2_5` |
+| `ELEVENLABS_VOICE_ID` | Backend host | ElevenLabs voice | `pNInz6obpgDQGcFmaJgB` |
+| `DATABASE_URL` | Backend host | SQLAlchemy database URL | `sqlite:///./test.db` |
+| `AI_STUB` | Backend host | Local demo mode. Set to `1` to skip Groq, OpenAI, and ElevenLabs. Do not enable this in production. | off |
+
+`llama3-70b-8192` and `eleven_monolingual_v1` no longer exist at those providers. Do not set them.
 
 ### Frontend Setup
 
-1. Clone the repository:
-
-```
-git clone https://github.com/kodegod/ai-recruiter.git
-```
-
-2. Install dependencies:
+From `frontend/ai-recruiter-frontend`:
 
 ```
 npm install
 ```
 
-3. Set up environment variable
+Optional `.env` (no spaces around `=`):
 
 ```
-REACT_APP_API_URL = http://localhost:8000
+REACT_APP_API_URL=http://localhost:8000
 ```
-
-4. Start the development server:
 
 ```
 npm start
 ```
 
-The app will be available at http://localhost:3000.
+The app is at http://localhost:3000. `npm test -- --watchAll=false` runs the UI test, and `npm run build` creates the production bundle.
 
 ### Backend Setup
 
-1. Install dependencies:
+From `backend`:
 
 ```
 pip install -r requirements.txt
 ```
 
-2. Set up environment variables:
-
-Create a .env file in the backend directory:
-
-```
-OPENAI_API_KEY=<your_openai_api_key>
-GROQ_API_KEY=<your_groq_api_key>
-ELEVENLABS_API_KEY=<your_elevenlabs_api_key>
-```
-
-3. Start the server:
+Create `backend/.env` with the provider keys you have. Then:
 
 ```
 uvicorn main:app --reload
 ```
+
+The API is at http://localhost:8000. `python -m pytest` runs the API tests. Those tests force `AI_STUB=1` and do not call the providers.
+
+### Production
+
+The Vercel project at https://ai-recruiter-tau.vercel.app/ is the static frontend only. Its built bundle calls `https://ai-recruiter-1dev.onrender.com`. That Render service is suspended by its owner (`x-render-routing: suspend-by-user`), so every API route returns HTTP 503 HTML and the browser reports a network/CORS error.
+
+Vercel settings that matter:
+
+- Root directory: `frontend/ai-recruiter-frontend`
+- Build command: `npm run build`
+- Output directory: `build`
+- Environment variable: `REACT_APP_API_URL` set to the public backend origin, then redeploy. The value is baked into the JavaScript bundle.
+
+The FastAPI app is not a Vercel function. Interview audio plus Whisper, Groq, and ElevenLabs exceeds typical serverless time and body-size limits, and SQLite on a serverless disk does not persist. Host the API on a long-running service (unsuspend or recreate the Render service, or another host) and put `OPENAI_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, and `DATABASE_URL` in that host's environment, not in Vercel.
 
 
 

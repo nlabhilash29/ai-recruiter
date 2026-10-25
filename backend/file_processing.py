@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.doc', '.txt'}
+ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.txt'}
 
 def extract_text_from_file(file_path: str) -> Dict[str, Any]:
     """
@@ -288,8 +288,8 @@ def extract_job_details(content: str) -> Dict[str, str]:
             break
     
     return {
-        "title": title,
-        "company": company
+        "title": title or "Untitled Position",
+        "company": company or "Unknown Company",
     }
 
 def extract_candidate_info(content: str) -> Dict[str, str]:
@@ -317,6 +317,6 @@ def extract_candidate_info(content: str) -> Dict[str, str]:
             break
     
     return {
-        "name": name,
-        "email": email
+        "name": name or "Unknown Candidate",
+        "email": email,
     }

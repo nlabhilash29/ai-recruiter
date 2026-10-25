@@ -5,6 +5,9 @@ function ParticlesBackground() {
   const mountRef = useRef(null);
 
   useEffect(() => {
+    if (process.env.NODE_ENV === 'test') {
+      return undefined;
+    }
     // Scene, Camera, Renderer
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(
@@ -13,10 +16,21 @@ function ParticlesBackground() {
       0.1,
       1000
     );
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    } catch (error) {
+      console.error("Background WebGL unavailable:", error);
+      return undefined;
+    }
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
-    mountRef.current.appendChild(renderer.domElement);
+    const mountNode = mountRef.current;
+    if (!mountNode) {
+      renderer.dispose();
+      return undefined;
+    }
+    mountNode.appendChild(renderer.domElement);
 
     // Particles
     const particlesGeometry = new THREE.BufferGeometry();
@@ -67,9 +81,10 @@ function ParticlesBackground() {
     // Cleanup
     return () => {
       cancelAnimationFrame(animationId);
-      if (mountRef.current && mountRef.current.contains(renderer.domElement)) {
-        mountRef.current.removeChild(renderer.domElement);
+      if (mountNode.contains(renderer.domElement)) {
+        mountNode.removeChild(renderer.domElement);
       }
+      renderer.dispose();
     };
   }, []);
 
@@ -84,6 +99,7 @@ function ParticlesBackground() {
         height: "100%",
         zIndex: -1, // Make it stay in the background
         overflow: "hidden",
+        pointerEvents: "none",
       }}
     ></div>
   );
