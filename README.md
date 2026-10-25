@@ -83,101 +83,94 @@ Responds to candidates with audio feedback using ElevenLabs API.
 
 ### Backend
 - **FastAPI:** Framework for building the RESTful API.
-- **SQLAlchemy:** ORM for database operations.
+- **SQLAlchemy:** ORM for SQLite and Postgres.
 - **OpenAI Whisper API:** Audio-to-text transcription.
-- **OpenAI GPT-like models:** AI-powered question generation and feedback.
-- **ElevenLabs API:** Text-to-speech functionality for audio responses.
+- **Groq `openai/gpt-oss-120b`:** Question generation and answer scoring. Responses are requested as JSON, with a labelled-text parser and a fallback when feedback would otherwise be empty.
+- **ElevenLabs API:** Text-to-speech for question playback.
 
 ### Database
-- **SQLite:** Used as the default database (can be swapped for PostgreSQL, MySQL, etc.).
+- **SQLite** locally when `DATABASE_URL` is unset (`sqlite:///./test.db`).
+- **Postgres** when `DATABASE_URL` is set. Render's `postgres://` URLs are rewritten to `postgresql+psycopg2://`.
+- The app creates tables on startup and does not load sample interviews.
 
-## Usage
+## Routes
 
-### Mock Interview
+- `/` practice interview for a candidate working on their own.
+- `/interview/:id` candidate interview. The page does not link to the recruiter area or to other reports.
+- `/interview/:id/results` feedback for a practice interview. A real interview report returns a sign-in error here.
+- `/recruiter` recruiter sign-in, interview list, and new-interview flow.
+- `/recruiter/interviews/:id` full report.
 
-- Navigate to the Mock Interview tab in the app.
-- Enter a job role and click Create Mock Interview.
-- The backend generates a dynamic JD and interview questions for the role.
+`frontend/ai-recruiter-frontend/vercel.json` rewrites those paths to `index.html` so a refresh on Vercel still loads the app.
 
-### Recruiter Dashboard
-- Navigate to the Recruiter Dashboard tab.
-- Upload:
-        - Job Description file.
-        - Candidate Resume file.
-        - Customize or confirm AI-generated interview questions.
-- A unique Interview ID is generated.
+## Recruiter access
 
-### Video Interview
+Set `RECRUITER_PASSCODE` on the backend. `POST /recruiter/login` checks it and returns an HMAC token that the browser stores in `localStorage` for 12 hours. Upload, question editing, the interview list, and report endpoints require that token.
 
-- Navigate to the Video Interview tab.
-- Enter the Interview ID generated from the Recruiter Dashboard or Mock Interview.
-- Answer questions in real-time, and the backend:
-- Transcribes audio.
-- Scores and analyzes responses.
-- Provides feedback.
+If `RECRUITER_PASSCODE` is unset, those endpoints respond with HTTP 503 and the message `Recruiter access is not configured. Set RECRUITER_PASSCODE on the server.` They are not left open. Practice interviews and candidate interview links keep working.
+
+Only audio is uploaded from the interview page. The camera preview is for framing and is not sent to the API.
 
 ## Setup and Installation
 
 ### Prerequisites
 
-1. Node.js and npm (for the frontend).
-2. Python 3.8+ (for the backend).
-3. Environment Variables:
-- DATABASE_URL: Database connection string (default: SQLite).
-- OPENAI_API_KEY: OpenAI API key for transcription and question generation.
-- GROQ_API_KEY: API key for LLM-based question generation.
-- ELEVENLABS_API_KEY: ElevenLabs API key for text-to-speech functionality.
+1. Node.js and npm (frontend).
+2. Python 3.11 (backend; 3.11.9 on Render).
+3. Environment variables listed in `backend/.env.example` and `frontend/ai-recruiter-frontend/.env.example`.
 
-### Frontend Setup
-
-1. Clone the repository:
+### Frontend
 
 ```
-git clone https://github.com/kodegod/ai-recruiter.git
+git clone https://github.com/nlabhilash29/ai-recruiter.git
+cd frontend/ai-recruiter-frontend
+npm ci
 ```
 
-2. Install dependencies:
+Create `.env.local`:
 
 ```
-npm install
+REACT_APP_API_URL=http://localhost:8000
 ```
 
-3. Set up environment variable
-
-```
-REACT_APP_API_URL = http://localhost:8000
-```
-
-4. Start the development server:
+`REACT_APP_API_URL` is read at build time. On Vercel, set it to the Render URL (`https://ai-recruiter-x7qm.onrender.com`) and redeploy after changing it.
 
 ```
 npm start
 ```
 
-The app will be available at http://localhost:3000.
+The app is at http://localhost:3000.
 
-### Backend Setup
+### Backend
 
-1. Install dependencies:
+From `backend/`:
 
 ```
 pip install -r requirements.txt
 ```
 
-2. Set up environment variables:
-
-Create a .env file in the backend directory:
+Create `.env` from `.env.example` with `OPENAI_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, and `RECRUITER_PASSCODE`. Questions and scoring use Groq `openai/gpt-oss-120b` (`GROQ_MODEL` overrides it). Transcription uses OpenAI Whisper. Speech uses ElevenLabs.
 
 ```
-OPENAI_API_KEY=<your_openai_api_key>
-GROQ_API_KEY=<your_groq_api_key>
-ELEVENLABS_API_KEY=<your_elevenlabs_api_key>
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-3. Start the server:
+Render start command, with root directory `backend/`:
 
 ```
-uvicorn main:app --reload
+uvicorn main:app --host 0.0.0.0 --port $PORT
+```
+
+Set `DATABASE_URL` on Render to the Postgres connection string so interviews survive restarts. SQLite on Render's filesystem does not persist.
+
+`AI_STUB=1` runs the API without calling Groq, Whisper, or ElevenLabs. Useful for local smoke tests.
+
+### Tests
+
+From `backend/`:
+
+```
+python -m unittest discover tests
 ```
 
 
