@@ -253,7 +253,7 @@ export default function RecruiterPage() {
         <ul className="interview-list">
           {interviews.filter((interview) => interview.status === "completed").map((interview) => {
             const score = formatScore(interview.overall_score);
-            const title = [interview.candidate_name || "Candidate", interview.job_title || "Role"].join(" · ");
+            const title = interview.candidate_name || "Candidate";
             return (
               <li key={interview.interview_id}>
                 <div>
