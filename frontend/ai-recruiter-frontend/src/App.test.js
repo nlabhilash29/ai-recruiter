@@ -1,8 +1,10 @@
 import { render, screen } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+test('renders the interview navigation', () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Mock Interview' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Recruiter Dashboard' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Video Interview' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Create Mock Interview' })).toBeDisabled();
 });

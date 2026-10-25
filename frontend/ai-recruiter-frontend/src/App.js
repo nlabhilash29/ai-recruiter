@@ -12,6 +12,15 @@ function ThreeJsAnimation({ onAnimationComplete }) {
   const mountRef = useRef(null);
 
   useEffect(() => {
+    let renderer;
+    let animationId;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      onAnimationComplete();
+    };
+
     // Scene, Camera, Renderer
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(
@@ -20,10 +29,22 @@ function ThreeJsAnimation({ onAnimationComplete }) {
       0.1,
       1000
     );
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    } catch (error) {
+      console.error("WebGL unavailable:", error);
+      finish();
+      return undefined;
+    }
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
-    mountRef.current.appendChild(renderer.domElement);
+    const mountNode = mountRef.current;
+    if (!mountNode) {
+      finish();
+      renderer.dispose();
+      return undefined;
+    }
+    mountNode.appendChild(renderer.domElement);
 
     // Lighting
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
@@ -64,7 +85,7 @@ function ThreeJsAnimation({ onAnimationComplete }) {
         const textGeometry = new TextGeometry("AI Recruiter", {
           font: font,
           size: 2, // Increased text size
-          height: 0.3, // Adjusted height for better depth
+          depth: 0.3,
         });
         const textMaterial = new THREE.MeshStandardMaterial({
           color: 0x3498db, // Text color set to #3498db
@@ -106,7 +127,7 @@ function ThreeJsAnimation({ onAnimationComplete }) {
           if (progress < 1) {
             requestAnimationFrame(animateText);
           } else {
-            onAnimationComplete();
+            finish();
           }
         };
 
@@ -115,11 +136,11 @@ function ThreeJsAnimation({ onAnimationComplete }) {
       undefined, // onProgress
       (error) => {
         console.error("Font loading failed:", error);
+        finish();
       }
     );
 
     // Particles Animation
-    let animationId;
     const animate = () => {
       const positions = particlesGeometry.attributes.position.array;
 
@@ -139,10 +160,12 @@ function ThreeJsAnimation({ onAnimationComplete }) {
 
     // Cleanup
     return () => {
+      settled = true;
       cancelAnimationFrame(animationId);
-      if (mountRef.current && mountRef.current.contains(renderer.domElement)) {
-        mountRef.current.removeChild(renderer.domElement);
+      if (mountNode.contains(renderer.domElement)) {
+        mountNode.removeChild(renderer.domElement);
       }
+      renderer.dispose();
     };
   }, [onAnimationComplete]);
 
@@ -150,7 +173,9 @@ function ThreeJsAnimation({ onAnimationComplete }) {
 }
 
 function App() {
-  const [showLandingAnimation, setShowLandingAnimation] = useState(true); // Track landing animation state
+  const [showLandingAnimation, setShowLandingAnimation] = useState(
+    process.env.NODE_ENV !== 'test'
+  );
   const [activeTab, setActiveTab] = useState('mockinterview');
 
   const handleAnimationComplete = () => {
@@ -161,7 +186,12 @@ function App() {
     <>
       {/* Render Landing Animation or Main App */}
       {showLandingAnimation ? (
-        <ThreeJsAnimation onAnimationComplete={handleAnimationComplete} />
+        <div className="landing-shell">
+          <ThreeJsAnimation onAnimationComplete={handleAnimationComplete} />
+          <button type="button" className="skip-intro" onClick={handleAnimationComplete}>
+            Skip intro
+          </button>
+        </div>
       ) : (
         <>
           {/* Particles Background */}

@@ -1,5 +1,6 @@
 from groq import Groq
 import os
+import re
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 import logging
@@ -11,13 +12,57 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# Get API key
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found. Please check your .env file.")
+class AIConfigurationError(RuntimeError):
+    """Raised when an AI provider is required and not configured."""
 
-# Initialize Groq client
-client = Groq(api_key=GROQ_API_KEY)
+
+def ai_stub_enabled() -> bool:
+    return os.getenv("AI_STUB", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Get API key. The process must still boot when the key is absent so the
+# non-AI routes (uploads, session lookup, reports) can run.
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip() or None
+# llama3-70b-8192 was shut down on 2025-08-30. Its replacement,
+# llama-3.3-70b-versatile, was removed from Groq's developer tier on
+# 2026-08-16. openai/gpt-oss-120b is the current recommended model.
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b").strip()
+GROQ_REASONING_EFFORT = os.getenv("GROQ_REASONING_EFFORT", "low").strip()
+
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+if client is None:
+    logger.warning("GROQ_API_KEY is not set. Question generation will use built-in questions.")
+
+
+def complete_chat(messages: List[Dict[str, str]], max_completion_tokens: int = 2000, temperature: float = 0.4) -> str:
+    """Call Groq and return the visible answer text."""
+    if client is None:
+        raise AIConfigurationError("GROQ_API_KEY is not configured")
+
+    kwargs: Dict[str, Any] = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_completion_tokens": max_completion_tokens,
+    }
+    if GROQ_REASONING_EFFORT:
+        kwargs["reasoning_effort"] = GROQ_REASONING_EFFORT
+
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as exc:
+        # Some models reject reasoning_effort. Retry once without it.
+        if GROQ_REASONING_EFFORT and "reasoning_effort" in str(exc):
+            kwargs.pop("reasoning_effort", None)
+            response = client.chat.completions.create(**kwargs)
+        else:
+            raise
+
+    message = response.choices[0].message
+    content = (getattr(message, "content", None) or "").strip()
+    if not content:
+        content = (getattr(message, "reasoning", None) or "").strip()
+    return content
 
 async def modify_questions(questions: List[Dict[str, Any]], feedback: str) -> List[Dict[str, Any]]:
     """
@@ -47,18 +92,20 @@ Provide modified questions in the same format:
    Key Points: [Key points to look for in answer]
 """
 
-        response = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
+        if client is None:
+            logger.info("Skipping question edits because GROQ_API_KEY is not configured")
+            return questions
+
+        generated_text = complete_chat(
+            [
                 {"role": "system", "content": "You are an expert at refining interview questions based on feedback."},
-                {"role": "user", "content": prompt}
+                {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
-            max_tokens=2000
+            max_completion_tokens=2000,
         )
 
         # Parse the modified questions
-        modified_questions = parse_generated_questions(response.choices[0].message.content)
+        modified_questions = parse_generated_questions(generated_text)
         
         # Validate and clean up modified questions
         validated_questions = []
@@ -138,29 +185,31 @@ Provide the questions in this EXACT format:
 Important: Ensure questions are highly specific to the job description and candidate's background.
 """
 
-        logger.info("Requesting questions from Llama model...")
+        if client is None:
+            logger.warning("GROQ_API_KEY is not configured. Using default interview questions.")
+            return get_default_questions()
+
+        logger.info("Requesting questions from %s...", GROQ_MODEL)
         
         # Make multiple attempts to get good questions
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                response = client.chat.completions.create(
-                    model="llama3-70b-8192",
-                    messages=[
+                generated_text = complete_chat(
+                    [
                         {
                             "role": "system",
                             "content": """You are an expert AI recruiter who generates insightful, 
                             specific interview questions based on job descriptions and resumes. 
-                            Focus on creating questions that thoroughly evaluate candidate qualifications."""
+                            Focus on creating questions that thoroughly evaluate candidate qualifications.
+                            Reply with only the five questions in the requested format."""
                         },
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=0.7,
-                    max_tokens=2000
+                    max_completion_tokens=4000,
                 )
 
                 # Parse the response into structured format
-                generated_text = response.choices[0].message.content
                 questions = parse_generated_questions(generated_text)
                 
                 # Validate the generated questions
@@ -177,7 +226,7 @@ Important: Ensure questions are highly specific to the job description and candi
                     raise
 
         # If we couldn't get good questions after all attempts, use default questions
-        logger.warning("Could not generate valid questions from Llama model, using defaults")
+        logger.warning("Could not generate valid questions from the configured model, using defaults")
         return get_default_questions()
 
     except Exception as e:
@@ -251,13 +300,15 @@ def parse_generated_questions(text: str) -> List[Dict[str, Any]]:
     current_question = {}
     
     try:
+        text = (text or "").replace("**", "").replace("__", "")
         for line in text.split('\n'):
-            line = line.strip()
+            line = line.strip().lstrip("-").strip()
             if not line:
                 continue
             
             # Check for new question
-            if line.startswith('Question:') or (line[0].isdigit() and line[1] == '.'):
+            numbered = len(line) > 2 and line[0].isdigit() and line[1] == "."
+            if line.startswith('Question:') or numbered:
                 if current_question and 'question_text' in current_question:
                     questions.append(current_question)
                 current_question = {
@@ -287,11 +338,33 @@ def parse_generated_questions(text: str) -> List[Dict[str, Any]]:
         logger.error(f"Error parsing questions: {str(e)}")
         return []
 
+def heuristic_analysis(question: str, response_text: str) -> Dict[str, Any]:
+    """Local scoring used when AI_STUB is on and no Groq key is available."""
+    words = [word for word in response_text.split() if word]
+    length_score = min(10.0, max(3.0, len(words) / 8))
+    question_terms = {word.lower().strip(".,?") for word in question.split() if len(word) > 4}
+    overlap = sum(1 for word in words if word.lower().strip(".,?") in question_terms)
+    relevance = min(10.0, length_score + min(2.0, overlap))
+    return {
+        "relevance_score": round(relevance, 1),
+        "clarity_score": round(min(10.0, 4 + len(words) / 12), 1),
+        "technical_score": round(length_score, 1),
+        "key_points": "",
+        "improvement_areas": "Connect GROQ_API_KEY for model-written coaching.",
+        "feedback": "Stub analysis because AI_STUB is enabled. Set GROQ_API_KEY for real scoring.",
+    }
+
+
 async def analyze_response(question: str, response: str) -> Dict[str, Any]:
     """
     Analyze a candidate's response to a question
     """
     try:
+        if client is None:
+            if ai_stub_enabled():
+                return heuristic_analysis(question, response)
+            raise AIConfigurationError("GROQ_API_KEY is not configured")
+
         prompt = f"""Analyze this interview response based on the following criteria:
 1. Relevance to the question (0-10)
 2. Clarity of communication (0-10)
@@ -311,20 +384,20 @@ Improvement Areas: [areas]
 Overall Feedback: [feedback]
 """
 
-        response = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[
-                {"role": "system", "content": "You are an expert at evaluating interview responses."},
+        analysis_text = complete_chat(
+            [
+                {"role": "system", "content": "You are an expert at evaluating interview responses. Reply using the requested labels only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.7
+            max_completion_tokens=1500,
         )
 
         # Parse the analysis
-        analysis_text = response.choices[0].message.content
         analysis = parse_response_analysis(analysis_text)
         return analysis
 
+    except AIConfigurationError:
+        raise
     except Exception as e:
         logger.error(f"Error analyzing response: {str(e)}")
         # Return default scores if analysis fails
@@ -337,38 +410,15 @@ Overall Feedback: [feedback]
             'key_points': ''
         }
 
-def parse_response_analysis(text: str) -> Dict[str, Any]:
-    """
-    Parse the response analysis into a structured format
-    """
-    analysis = {
-        'relevance_score': 5,
-        'clarity_score': 5,
-        'technical_score': 5,
-        'key_points': '',
-        'improvement_areas': '',
-        'feedback': ''
-    }
-    
+def _parse_score(raw: str, default: float = 5.0) -> float:
+    match = re.search(r"\d+(?:\.\d+)?", raw or "")
+    if not match:
+        return default
     try:
-        for line in text.split('\n'):
-            line = line.strip()
-            if line.startswith('Relevance Score:'):
-                analysis['relevance_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Clarity Score:'):
-                analysis['clarity_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Technical Score:'):
-                analysis['technical_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Key Points Covered:'):
-                analysis['key_points'] = line.split(':')[1].strip()
-            elif line.startswith('Improvement Areas:'):
-                analysis['improvement_areas'] = line.split(':')[1].strip()
-            elif line.startswith('Overall Feedback:'):
-                analysis['feedback'] = line.split(':')[1].strip()
-    except Exception as e:
-        logger.error(f"Error parsing analysis: {str(e)}")
-    
-    return analysis
+        return max(0.0, min(10.0, float(match.group(0))))
+    except ValueError:
+        return default
+
 
 def parse_response_analysis(text: str) -> Dict[str, Any]:
     """
@@ -384,20 +434,21 @@ def parse_response_analysis(text: str) -> Dict[str, Any]:
     }
     
     try:
+        text = (text or "").replace("**", "")
         for line in text.split('\n'):
-            line = line.strip()
-            if line.startswith('Relevance Score:'):
-                analysis['relevance_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Clarity Score:'):
-                analysis['clarity_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Technical Score:'):
-                analysis['technical_score'] = float(line.split(':')[1].strip())
-            elif line.startswith('Key Points Covered:'):
-                analysis['key_points'] = line.split(':')[1].strip()
-            elif line.startswith('Improvement Areas:'):
-                analysis['improvement_areas'] = line.split(':')[1].strip()
-            elif line.startswith('Overall Feedback:'):
-                analysis['feedback'] = line.split(':')[1].strip()
+            line = line.strip().lstrip("-").strip()
+            if line.lower().startswith('relevance score:'):
+                analysis['relevance_score'] = _parse_score(line.split(':', 1)[1])
+            elif line.lower().startswith('clarity score:'):
+                analysis['clarity_score'] = _parse_score(line.split(':', 1)[1])
+            elif line.lower().startswith('technical score:'):
+                analysis['technical_score'] = _parse_score(line.split(':', 1)[1])
+            elif line.lower().startswith('key points covered:'):
+                analysis['key_points'] = line.split(':', 1)[1].strip()
+            elif line.lower().startswith('improvement areas:'):
+                analysis['improvement_areas'] = line.split(':', 1)[1].strip()
+            elif line.lower().startswith('overall feedback:'):
+                analysis['feedback'] = line.split(':', 1)[1].strip()
     except Exception as e:
         logger.error(f"Error parsing analysis: {str(e)}")
     

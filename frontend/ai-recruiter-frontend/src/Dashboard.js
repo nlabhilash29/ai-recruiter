@@ -1,8 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import './Dashboard.css';
-
-const API_URL = process.env.REACT_APP_API_URL
+import { API_URL, apiErrorMessage } from './api';
 
 function Dashboard() {
   // State management
@@ -137,22 +136,7 @@ function Dashboard() {
     } catch (error) {
       console.error('Upload Error:', error);
       
-      let errorMessage = 'Error uploading files or generating questions.';
-      
-      if (error.response) {
-        console.error('Error Response:', error.response.data);
-        console.error('Status:', error.response.status);
-        console.error('Headers:', error.response.headers);
-        errorMessage = error.response.data.detail || error.response.data.message || errorMessage;
-      } else if (error.request) {
-        console.error('Error Request:', error.request);
-        errorMessage = 'No response from server. Please check your connection.';
-      } else {
-        console.error('Error Message:', error.message);
-        errorMessage = error.message;
-      }
-      
-      setError(errorMessage);
+      setError(apiErrorMessage(error, 'Error uploading files or generating questions.'));
     } finally {
       setIsLoading(false);
       setUploadProgress({ jd: 0, resume: 0 });
@@ -176,27 +160,28 @@ function Dashboard() {
     ));
   };
 
+  const persistQuestion = async (questionId) => {
+    const question = questions.find(q => q.id === questionId);
+    await axios.put(
+      `${API_URL}/interview/questions/${questionId}`,
+      {
+        question_text: question.question_text
+      }
+    );
+    setEditingQuestions(prev => ({
+      ...prev,
+      [questionId]: false
+    }));
+  };
+
   // Save individual question
   const handleSaveQuestion = async (questionId) => {
     try {
       setIsLoading(true);
-      const question = questions.find(q => q.id === questionId);
-      
-      await axios.put(
-        `${API_URL}/interview/questions/${questionId}`,
-        {
-          question_text: question.question_text
-        }
-      );
-      
-      setEditingQuestions(prev => ({
-        ...prev,
-        [questionId]: false
-      }));
-      
+      await persistQuestion(questionId);
       setSuccess('Question saved successfully!');
     } catch (error) {
-      setError('Error saving question: ' + (error.response?.data?.detail || error.message));
+      setError('Error saving question: ' + apiErrorMessage(error, 'Request failed'));
     } finally {
       setIsLoading(false);
     }
@@ -208,12 +193,10 @@ function Dashboard() {
       setIsLoading(true);
       setError(null);
       
-      // Save any remaining edited questions
-      const savePromises = Object.keys(editingQuestions)
-        .filter(id => editingQuestions[id])
-        .map(id => handleSaveQuestion(id));
-      
-      await Promise.all(savePromises);
+      const pendingIds = Object.keys(editingQuestions).filter(id => editingQuestions[id]);
+      for (const id of pendingIds) {
+        await persistQuestion(id);
+      }
       
       // Mark questions as confirmed
       await axios.post(`${API_URL}/interview/${interviewId}/confirm`);
@@ -222,7 +205,7 @@ function Dashboard() {
       setSuccess(`Questions confirmed! Use Interview ID: ${interviewId} for the video interview.`);
       
     } catch (error) {
-      setError('Error confirming questions: ' + (error.response?.data?.detail || error.message));
+      setError('Error confirming questions: ' + apiErrorMessage(error, 'Request failed'));
     } finally {
       setIsLoading(false);
     }
@@ -231,15 +214,14 @@ function Dashboard() {
   // Handle interview report search
   const handleSearchReport = async () => {
     if (!searchInterviewId.trim()) {
-      setError('Please enter an Interview ID');
+      setSearchError('Please enter an Interview ID');
       return;
     }
 
     try {
-      setIsLoading(true);
-      setError(null);
+      setIsValidatingId(true);
+      setSearchError(null);
 
-      // Log the ID being searched for debugging
       console.log('Searching for interview:', searchInterviewId);
 
       const response = await axios.get(
@@ -255,26 +237,17 @@ function Dashboard() {
       if (response.data) {
         setCandidateReport(response.data);
       } else {
-        setError('No data found for this interview ID');
+        setSearchError('No data found for this interview ID');
       }
     } catch (error) {
       console.error('Error fetching report:', error.response || error);
-      let errorMessage = 'Error fetching report: ';
-      
-      if (error.response?.status === 404) {
-        errorMessage = 'Interview not found';
-      } else if (error.response?.data?.detail) {
-        errorMessage = error.response.data.detail;
-      } else if (error.response?.data?.message) {
-        errorMessage = error.response.data.message;
-      } else {
-        errorMessage += 'Failed to fetch interview report';
-      }
-      
-      setError(errorMessage);
+      const errorMessage = error.response?.status === 404
+        ? 'Interview not found'
+        : apiErrorMessage(error, 'Failed to fetch interview report');
+      setSearchError(errorMessage);
       setCandidateReport(null);
     } finally {
-      setIsLoading(false);
+      setIsValidatingId(false);
     }
   };
 
@@ -306,7 +279,7 @@ function Dashboard() {
             <input 
               type="file" 
               onChange={handleJdFileChange}
-              accept=".pdf,.doc,.docx,.txt"
+              accept=".pdf,.docx,.txt"
               disabled={isLoading}
             />
             {uploadProgress.jd > 0 && uploadProgress.jd < 100 && (
@@ -324,7 +297,7 @@ function Dashboard() {
             <input 
               type="file" 
               onChange={handleResumeFileChange}
-              accept=".pdf,.doc,.docx,.txt"
+              accept=".pdf,.docx,.txt"
               disabled={isLoading}
             />
             {uploadProgress.resume > 0 && uploadProgress.resume < 100 && (

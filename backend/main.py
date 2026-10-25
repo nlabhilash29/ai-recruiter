@@ -12,14 +12,24 @@ from groq import Groq
 import json
 import requests
 import uuid
-from typing import List, Set
+from typing import List, Optional, Set
 import shutil
 from datetime import datetime
-from pydub import AudioSegment 
+import base64
+import io
+import math
+import struct
+import wave
 
 # Import custom modules
-from file_processing import process_jd_file, process_resume_file, extract_text_from_file
-from question_generation import generate_interview_questions, modify_questions, analyze_response
+from file_processing import process_jd_file, process_resume_file
+from question_generation import (
+    AIConfigurationError,
+    ai_stub_enabled,
+    analyze_response,
+    complete_chat,
+    generate_interview_questions,
+)
 
 # Import models
 from models import (
@@ -41,42 +51,47 @@ app = FastAPI(title="AI Recruiter API")
 async def root():
     return {"message": "Welcome to the AI Recruiter API"}
 
-# Update CORS settings for production
+# Wildcard origins cannot be combined with credentialed CORS. This API uses
+# no cookies, so reflect every origin without Allow-Credentials.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For development only. In production, specify exact origins
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Database setup
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
-engine = create_engine(DATABASE_URL)
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Initialize database
 init_db(engine)
 
-# API Key Verification
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+# API keys are optional at startup. Routes that call a provider return 503
+# with the missing variable named, unless AI_STUB=1 is set for local demos.
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip() or None
+ELEVENLABS_API_KEY = (os.getenv("ELEVENLABS_API_KEY") or "").strip() or None
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip() or None
+# eleven_monolingual_v1 was removed on 2026-07-09.
+ELEVENLABS_MODEL_ID = (os.getenv("ELEVENLABS_MODEL_ID") or "eleven_flash_v2_5").strip()
+ELEVENLABS_VOICE_ID = (os.getenv("ELEVENLABS_VOICE_ID") or "pNInz6obpgDQGcFmaJgB").strip()
 
-# OpenAI API Key
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY is not set in environment variables")
+for missing_name, missing_value in (
+    ("OPENAI_API_KEY", OPENAI_API_KEY),
+    ("GROQ_API_KEY", GROQ_API_KEY),
+    ("ELEVENLABS_API_KEY", ELEVENLABS_API_KEY),
+):
+    if not missing_value:
+        logger.warning("%s is not set. Endpoints that need it will fail until it is configured.", missing_name)
 
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in environment variables")
-if not ELEVENLABS_API_KEY:
-    raise ValueError("ELEVENLABS_API_KEY not found in environment variables")
-
-# Initialize Groq client
-client = Groq(api_key=GROQ_API_KEY)
+# Initialize Groq client only when a key is present.
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
 # Constants for file validation
-ALLOWED_DOCUMENT_TYPES: Set[str] = {'.pdf', '.docx', '.doc', '.txt', '.rtf'}
+ALLOWED_DOCUMENT_TYPES: Set[str] = {'.pdf', '.docx', '.txt'}
 MAX_FILE_SIZE: int = 5 * 1024 * 1024  # 5 MB in bytes
 
 # Dependency to get database session
@@ -99,8 +114,10 @@ def validate_file(file: UploadFile, allowed_types: Set[str], max_size: int) -> N
             detail=f"Invalid file type. Allowed types are: {', '.join(allowed_types)}"
         )
     
-    # Check content type
-    if not file.content_type.startswith(('application/', 'text/')):
+    # Check content type. Browsers sometimes omit it or send octet-stream
+    # for otherwise valid documents, so only reject an explicit mismatch.
+    content_type = (file.content_type or "").lower()
+    if content_type and not content_type.startswith(('application/', 'text/')):
         raise HTTPException(
             status_code=400,
             detail="Invalid content type. Must be a document file."
@@ -326,7 +343,11 @@ async def get_interview_details(interview_id: str, db: Session = Depends(get_db)
         total_questions = len(interview_session.questions)
         answered_questions = 0
         
-        for question in interview_session.questions:
+        ordered_questions = sorted(
+            interview_session.questions,
+            key=lambda question: question.sequence_number or 0,
+        )
+        for question in ordered_questions:
             # Get responses for this question
             responses = [
                 {
@@ -374,8 +395,8 @@ async def get_interview_details(interview_id: str, db: Session = Depends(get_db)
             "score_breakdown": {
                 "technical_proficiency": interview_session.technical_score,
                 "communication_skills": interview_session.communication_score,
-                "problem_solving": sum(q.responses[0].score for q in interview_session.questions if q.responses and q.question_type == "technical") / total_questions if total_questions > 0 else 0,
-                "experience_relevance": sum(q.responses[0].score for q in interview_session.questions if q.responses and q.question_type == "experience") / total_questions if total_questions > 0 else 0
+                "problem_solving": sum((q.responses[0].score or 0) for q in interview_session.questions if q.responses and q.question_type == "technical") / total_questions if total_questions > 0 else 0,
+                "experience_relevance": sum((q.responses[0].score or 0) for q in interview_session.questions if q.responses and q.question_type == "experience") / total_questions if total_questions > 0 else 0
             }
         }
         
@@ -412,15 +433,15 @@ async def get_interview_details(interview_id: str, db: Session = Depends(get_db)
             "interview_summary": {
                 "strengths": [
                     response.ai_feedback 
-                    for question in interview_session.questions 
+                    for question in ordered_questions
                     for response in question.responses 
-                    if response.score >= 8
+                    if response.score is not None and response.score >= 8 and response.ai_feedback
                 ],
                 "areas_for_improvement": [
                     response.improvement_suggestions
-                    for question in interview_session.questions
+                    for question in ordered_questions
                     for response in question.responses
-                    if response.score < 6
+                    if response.score is not None and response.score < 6 and response.improvement_suggestions
                 ],
                 "overall_recommendation": "Recommended for next round" if interview_session.overall_score >= 7 else "Consider other candidates" if interview_session.overall_score < 5 else "Requires further evaluation"
             }
@@ -459,9 +480,14 @@ async def update_interview_question(
         
         # Update question fields
         if "question_text" in question_update:
-            question.question_text = question_update["question_text"]
+            new_text = str(question_update.get("question_text") or "").strip()
+            if not new_text:
+                raise HTTPException(status_code=400, detail="question_text cannot be empty")
+            if not question.is_modified:
+                question.original_question = question.question_text
+            question.question_text = new_text
             question.is_modified = True
-            question.modified_at = datetime.utcnow()
+            question.updated_at = datetime.utcnow()
         
         db.commit()
         
@@ -577,6 +603,38 @@ async def search_interviews(
         for interview in interviews
     ]
 
+def fallback_job_description(job_role: str) -> str:
+    role = (job_role or "Software Engineer").strip()
+    return (
+        f"Job Title: {role}\n"
+        "Company: Mock Company\n\n"
+        f"We are hiring a {role} to design, build, and improve production software with a small team.\n"
+        "Responsibilities include shipping features, reviewing code, debugging production issues, "
+        "and collaborating with product and design.\n"
+        "Required skills: clear communication, relevant project experience, and the core tools of the role.\n"
+        "Qualifications: hands-on experience in a similar position and examples of work you can discuss.\n"
+    )
+
+
+async def generate_mock_job_description(job_role: str) -> str:
+    """Build a mock job description, using Groq when it is configured."""
+    if client is None:
+        logger.warning("GROQ_API_KEY is not configured. Using a template job description.")
+        return fallback_job_description(job_role)
+    try:
+        jd_prompt = f"""
+        Write a concise and detailed job description for the role of {job_role}.
+        Include key responsibilities, required skills, and qualifications.
+        """
+        return complete_chat(
+            [{"role": "user", "content": jd_prompt}],
+            max_completion_tokens=1200,
+        )
+    except Exception as exc:
+        logger.error("Falling back to a template job description: %s", exc)
+        return fallback_job_description(job_role)
+
+
 def get_or_create_mock_resume(db):
     """
     Retrieve or create a mock resume for mock interviews.
@@ -592,7 +650,7 @@ def get_or_create_mock_resume(db):
             file_type="generated"
         )
         db.add(mock_resume)
-        db.commit()
+        db.flush()
     return mock_resume
 
 @app.post("/mock-interview")
@@ -603,18 +661,7 @@ async def create_mock_interview(job_role: str = Form(...), db: Session = Depends
     try:
         logger.info(f"Creating mock interview for job role: {job_role}")
 
-        # Generate a JD dynamically
-        jd_prompt = f"""
-        Write a concise and detailed job description for the role of {job_role}.
-        Include key responsibilities, required skills, and qualifications.
-        """
-        jd_response = client.chat.completions.create(
-            model="llama3-70b-8192",
-            messages=[{"role": "user", "content": jd_prompt}],
-            temperature=0.7,
-            max_tokens=300
-        )
-        jd_content = jd_response.choices[0].message.content.strip()
+        jd_content = await generate_mock_job_description(job_role)
         logger.info(f"Generated JD for role {job_role}: {jd_content[:100]}...")
 
         # Save the generated JD
@@ -679,6 +726,72 @@ async def create_mock_interview(job_role: str = Form(...), db: Session = Depends
 
 
 # Modified talk-video endpoint to use interview session
+def audio_extension(content: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
+    """Pick a Whisper-supported extension from the recording itself."""
+    header = content[:16]
+    content_type = (content_type or "").lower()
+    if header.startswith(b"RIFF") or "wav" in content_type:
+        return "wav"
+    if header.startswith(b"\x1a\x45\xdf\xa3") or "webm" in content_type or "matroska" in content_type:
+        return "webm"
+    if header.startswith(b"OggS") or "ogg" in content_type:
+        return "ogg"
+    if header.startswith(b"ID3") or header[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2") or "mpeg" in content_type or "mp3" in content_type:
+        return "mp3"
+    if b"ftyp" in header or "mp4" in content_type or "m4a" in content_type:
+        return "m4a" if "m4a" in content_type else "mp4"
+    if filename and "." in filename:
+        extension = filename.rsplit(".", 1)[-1].lower()
+        if extension in {"wav", "webm", "mp3", "ogg", "m4a", "mp4", "flac", "mpeg"}:
+            return extension
+    return "wav"
+
+
+def audio_media_type(extension: str) -> str:
+    return {
+        "wav": "audio/wav",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "mpeg": "audio/mpeg",
+        "ogg": "audio/ogg",
+        "mp4": "audio/mp4",
+        "m4a": "audio/mp4",
+        "flac": "audio/flac",
+    }.get(extension, "application/octet-stream")
+
+
+def tone_wav(seconds: float = 0.5, frequency: float = 440.0) -> bytes:
+    """A short playable WAV so the browser can finish the interview without ElevenLabs."""
+    framerate = 16000
+    frames = int(seconds * framerate)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(framerate)
+        pcm = bytearray()
+        for index in range(frames):
+            sample = int(1200 * math.sin(2 * math.pi * frequency * index / framerate))
+            pcm.extend(struct.pack("<h", sample))
+        wav_file.writeframes(bytes(pcm))
+    return buffer.getvalue()
+
+
+def as_score(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "; ".join(str(item) for item in value)
+    return str(value)
+
+
 @app.post("/talk-video")
 async def process_video(
     file: UploadFile = File(...),
@@ -686,171 +799,153 @@ async def process_video(
     db: Session = Depends(get_db)
 ):
     """
-    Process audio from video interview and handle interview flow
+    Process one recorded answer and return spoken feedback plus the next prompt.
+    The first recording is the candidate's introduction and is not scored.
     """
+    interview_session = None
     try:
-        # Get interview session
         interview_session = db.query(InterviewSession).filter(
-            InterviewSession.id == interview_id
+            InterviewSession.id == interview_id.strip()
         ).first()
-        
+
         if not interview_session:
             raise HTTPException(status_code=404, detail="Interview session not found")
+        if interview_session.status == "completed":
+            raise HTTPException(status_code=400, detail="Interview is already completed")
+        if interview_session.status not in ("ready", "in_progress"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Interview is not ready (current status: {interview_session.status})"
+            )
 
-        # Validate file size
-        file_size = 0
         content = await file.read()
-        file_size = len(content)
-        await file.seek(0)  # Reset file pointer
-        
-        if file_size > 1024 * 1024 * 5:  # 5MB limit
+        if not content:
+            raise HTTPException(status_code=400, detail="Audio file is empty")
+        if len(content) > 5 * 1024 * 1024:
             raise HTTPException(
                 status_code=400,
                 detail="File too large. Please limit recordings to 5MB or less."
             )
-        
-        # Get current question count
-        answered_questions = db.query(CandidateResponse).filter(
-            CandidateResponse.interview_session_id == interview_session.id
-        ).count()
-        
-        # Get all questions for this interview
+
         all_questions = db.query(InterviewQuestion).filter(
             InterviewQuestion.interview_session_id == interview_session.id
         ).order_by(InterviewQuestion.sequence_number).all()
-        
-        if not all_questions:
+        if len(all_questions) != 5:
             raise HTTPException(status_code=400, detail="No questions found for this interview")
-        
-        # Check if interview is already complete
-        if interview_session.status == "completed":
-            raise HTTPException(status_code=400, detail="Interview is already completed")
-        
-        # Update interview status if just starting
-        if interview_session.status != "in_progress":
+
+        user_message = await transcribe_audio(content, file.filename, file.content_type)
+        logger.info("Transcribed message: %s...", user_message[:100])
+
+        answered_questions = db.query(CandidateResponse).filter(
+            CandidateResponse.interview_session_id == interview_session.id
+        ).count()
+        is_introduction = interview_session.status == "ready" and answered_questions == 0
+
+        if interview_session.status == "ready":
             interview_session.status = "in_progress"
-            interview_session.actual_start_time = datetime.utcnow()
-        
-        # Save uploaded audio file temporarily
-        temp_audio_path = f"temp_{uuid.uuid4()}.webm"
-        try:
-            # Save the original WebM file
-            with open(temp_audio_path, "wb") as buffer:
-                await file.seek(0)  # Ensure we're at the start of the file
-                buffer.write(content)
-            
-            # Convert audio to MP3 format
-            from pydub import AudioSegment
-            audio = AudioSegment.from_file(temp_audio_path, format="webm")
-            temp_mp3_path = f"temp_{uuid.uuid4()}.mp3"
-            audio.export(temp_mp3_path, format="mp3")
-            
-            # Transcribe audio using MP3 file
-            # Transcribe audio using OpenAI Whisper API
-            user_message = await transcribe_audio(file)
-            logger.info(f"Transcribed message: {user_message[:100]}...")
-                
-        except Exception as e:
-            logger.error(f"Error processing audio: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-            
-        finally:
-            # Clean up temporary files
-            try:
-                if os.path.exists(temp_audio_path):
-                    os.remove(temp_audio_path)
-                    logger.info("Temporary WebM file removed")
-                if os.path.exists(temp_mp3_path):
-                    os.remove(temp_mp3_path)
-                    logger.info("Temporary MP3 file removed")
-            except Exception as e:
-                logger.error(f"Error cleaning up temporary files: {str(e)}")
-        
-        # Get current question
-        current_question = next(
-            (q for q in all_questions if q.sequence_number == answered_questions + 1),
-            None
-        )
-        
-        if current_question:
-            # Create candidate response
-            response = CandidateResponse(
-                interview_session_id=interview_session.id,
-                question_id=current_question.id,
-                response_text=user_message,
-                response_audio_url="",  # You could store the audio file if needed
-                timestamp=datetime.utcnow()
-            )
-            db.add(response)
-            
-            # Analyze response
-            analysis = await analyze_response(current_question.question_text, user_message)
-            
-            # Update response with analysis
-            response.score = analysis.get("relevance_score", 0)
-            response.technical_accuracy = analysis.get("technical_score", 0)
-            response.clarity_score = analysis.get("clarity_score", 0)
-            response.ai_feedback = analysis.get("feedback", "")
-            response.improvement_suggestions = analysis.get("improvement_areas", "")
-            
-            # Check if this was the last question
-            if answered_questions + 1 >= len(all_questions):
-                interview_session.status = "completed"
-                interview_session.actual_end_time = datetime.utcnow()
-                
-                # Calculate final scores
-                responses = db.query(CandidateResponse).filter(
-                    CandidateResponse.interview_session_id == interview_session.id
-                ).all()
-                
-                interview_session.technical_score = sum(r.technical_accuracy or 0 for r in responses) / len(responses)
-                interview_session.communication_score = sum(r.clarity_score or 0 for r in responses) / len(responses)
-                interview_session.overall_score = (interview_session.technical_score + interview_session.communication_score) / 2
-                
-                ai_response = "Thank you for completing the interview. Your responses have been recorded. We will review them and get back to you soon. Have a great day!"
-            else:
-                # Get next question
-                next_question = next(
-                    (q for q in all_questions if q.sequence_number == answered_questions + 2),
-                    None
-                )
-                if next_question:
-                    ai_response = f"Thank you for your response. Here's your next question: {next_question.question_text}"
-                else:
-                    ai_response = "Thank you for your response."
-        else:
-            # If no current question (introduction phase)
+            if interview_session.actual_start_time is None:
+                interview_session.actual_start_time = datetime.utcnow()
+
+        if is_introduction:
+            interview_session.transcript = user_message
             ai_response = (
                 "Thank you for introducing yourself. Let's begin the interview. "
                 f"Here's your first question: {all_questions[0].question_text}"
             )
-        
+            answered_header = 0
+            current_question_number = 1
+        else:
+            current_question = next(
+                (question for question in all_questions if question.sequence_number == answered_questions + 1),
+                None
+            )
+            if current_question is None:
+                raise HTTPException(status_code=400, detail="No further questions are available for this interview")
+
+            response = CandidateResponse(
+                interview_session_id=interview_session.id,
+                question_id=current_question.id,
+                response_text=user_message,
+                response_audio_url="",
+                timestamp=datetime.utcnow()
+            )
+            db.add(response)
+            analysis = await analyze_response(current_question.question_text, user_message)
+            response.score = as_score(analysis.get("relevance_score"))
+            response.technical_accuracy = as_score(analysis.get("technical_score"))
+            response.clarity_score = as_score(analysis.get("clarity_score"))
+            response.ai_feedback = as_text(analysis.get("feedback"))
+            response.improvement_suggestions = as_text(analysis.get("improvement_areas"))
+
+            if answered_questions + 1 >= len(all_questions):
+                interview_session.status = "completed"
+                interview_session.actual_end_time = datetime.utcnow()
+                db.flush()
+                responses = db.query(CandidateResponse).filter(
+                    CandidateResponse.interview_session_id == interview_session.id
+                ).all()
+                count = len(responses) or 1
+                interview_session.technical_score = sum(r.technical_accuracy or 0 for r in responses) / count
+                interview_session.communication_score = sum(r.clarity_score or 0 for r in responses) / count
+                interview_session.overall_score = (
+                    interview_session.technical_score + interview_session.communication_score
+                ) / 2
+                questions_by_id = {question.id: question for question in all_questions}
+                cultural_scores = [
+                    r.score or 0
+                    for r in responses
+                    if questions_by_id.get(r.question_id)
+                    and questions_by_id[r.question_id].question_type == "cultural-fit"
+                ]
+                interview_session.cultural_fit_score = (
+                    sum(cultural_scores) / len(cultural_scores)
+                    if cultural_scores else interview_session.overall_score
+                )
+                ai_response = (
+                    "Thank you for completing the interview. Your responses have been recorded. "
+                    "We will review them and get back to you soon. Have a great day!"
+                )
+                current_question_number = len(all_questions)
+            else:
+                next_question = next(
+                    (question for question in all_questions if question.sequence_number == answered_questions + 2),
+                    None
+                )
+                ai_response = (
+                    f"Thank you for your response. Here's your next question: {next_question.question_text}"
+                    if next_question else "Thank you for your response."
+                )
+                current_question_number = answered_questions + 2
+            answered_header = answered_questions + 1
+
+        audio_output, media_type = text_to_speech(ai_response)
         db.commit()
-        logger.info(f"Processing completed, generating audio response: {ai_response[:100]}...")
-        
-        # Generate audio response
-        audio_output = text_to_speech(ai_response)
-        
-        # Return audio response with headers
+        logger.info("Processing completed, generating audio response: %s...", ai_response[:100])
+
         headers = {
             "X-Interview-Status": interview_session.status,
             "X-Total-Questions": str(len(all_questions)),
-            "X-Answered-Questions": str(answered_questions + 1),
-            "Access-Control-Expose-Headers": "X-Interview-Status, X-Total-Questions, X-Answered-Questions"
+            "X-Answered-Questions": str(answered_header),
+            "X-Current-Question": str(current_question_number),
+            "X-Assistant-Text": base64.b64encode(ai_response.encode("utf-8")).decode("ascii"),
+            "Access-Control-Expose-Headers": (
+                "X-Interview-Status, X-Total-Questions, X-Answered-Questions, "
+                "X-Current-Question, X-Assistant-Text"
+            ),
         }
-        
-        return StreamingResponse(
-            iter([audio_output]),
-            media_type="audio/mpeg",
-            headers=headers
-        )
-        
-    except HTTPException as he:
-        raise he
-    except Exception as e:
+        return StreamingResponse(iter([audio_output]), media_type=media_type, headers=headers)
+
+    except HTTPException:
         db.rollback()
-        logger.error(f"Error processing video: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise
+    except AIConfigurationError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error processing video: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 @app.get("/interview/check-completed")
 async def check_completed_interviews(db: Session = Depends(get_db)):
@@ -900,8 +995,17 @@ async def validate_interview_id(interview_id: str, db: Session = Depends(get_db)
         
         logger.info(f"Interview status: {interview.status}")
         
-        # Check if interview is in ready state
-        if interview.status != "ready":
+        # Ready sessions can start. In-progress sessions can be resumed after a
+        # dropped connection. Completed sessions cannot be recorded again.
+        if interview.status == "completed":
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "valid": False,
+                    "message": "Interview is already completed"
+                }
+            )
+        if interview.status not in ("ready", "in_progress"):
             logger.warning(f"Interview {interview_id} is in {interview.status} state, not ready")
             return JSONResponse(
                 status_code=400,
@@ -928,10 +1032,18 @@ async def validate_interview_id(interview_id: str, db: Session = Depends(get_db)
                 }
             )
         
+        answered = db.query(CandidateResponse).filter(
+            CandidateResponse.interview_session_id == interview.id
+        ).count()
+        current_question = 0 if interview.status == "ready" else min(answered + 1, len(questions))
+
         return {
             "valid": True,
-            "message": "Interview ID is valid and ready to start",
-            "total_questions": len(questions)
+            "message": "Interview ID is valid and ready to start" if interview.status == "ready" else "Interview is in progress",
+            "status": interview.status,
+            "total_questions": len(questions),
+            "answered_questions": answered,
+            "current_question": current_question,
         }
         
     except Exception as e:
@@ -941,66 +1053,62 @@ async def validate_interview_id(interview_id: str, db: Session = Depends(get_db)
             detail=f"Failed to validate interview ID: {str(e)}"
         )
 
-async def transcribe_audio(file):
+async def transcribe_audio(content: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
     """
-    Transcribe audio using OpenAI's Whisper API with plain text response handling.
+    Transcribe audio with OpenAI Whisper. The bytes are sent with their real format.
     """
-    temp_file_path = None
+    if ai_stub_enabled():
+        return (
+            "I have several years of relevant experience. I work with teammates, "
+            "break a problem into smaller pieces, and follow through until the result is shipped."
+        )
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
+
+    extension = audio_extension(content, filename, content_type)
+    temp_file_path = f"temp_{uuid.uuid4()}.{extension}"
     try:
-        file_content = await file.read()
-        temp_file_path = f"temp_{uuid.uuid4()}.mp3"
-
-        # Save the audio file temporarily
         with open(temp_file_path, "wb") as temp_file:
-            temp_file.write(file_content)
+            temp_file.write(content)
 
-        # Prepare the request for OpenAI Whisper API
         url = "https://api.openai.com/v1/audio/transcriptions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}"
-        }
-        files = {
-            "file": (temp_file_path, open(temp_file_path, "rb"), "audio/mpeg")
-        }
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
         data = {
             "model": "whisper-1",
-            "response_format": "text",  # Request plain text response
-            "language": "en"
+            "response_format": "text",
+            "language": "en",
         }
-
-        # Make the request to OpenAI API
         logger.info("Sending request to OpenAI Whisper API...")
-        response = requests.post(url, headers=headers, files=files, data=data, verify=False)
+        with open(temp_file_path, "rb") as audio_file:
+            files = {
+                "file": (os.path.basename(temp_file_path), audio_file, audio_media_type(extension))
+            }
+            response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
 
-        logger.info(f"OpenAI API response status: {response.status_code}")
-        logger.debug(f"OpenAI API response content: {response.text}")
-
-        # Check if the response is successful
+        logger.info("OpenAI API response status: %s", response.status_code)
         if response.status_code == 200:
-            transcription = response.text.strip()  # Handle plain text response
+            transcription = response.text.strip()
             if not transcription:
-                raise ValueError("Transcription is empty.")
-            logger.info("Audio transcription successful")
+                raise HTTPException(status_code=422, detail="Transcription is empty")
             return transcription
-        else:
-            # Handle specific HTTP errors
-            if response.status_code == 401:
-                raise HTTPException(status_code=401, detail="Unauthorized: Check your OpenAI API key")
-            elif response.status_code == 429:
-                raise HTTPException(status_code=429, detail="Rate limit exceeded: Please try again later")
-            elif response.status_code == 500:
-                raise HTTPException(status_code=500, detail="Server error: OpenAI API is currently unavailable")
-            else:
-                raise HTTPException(status_code=response.status_code, detail=f"Transcription request failed: {response.text}")
-
-    except Exception as e:
-        logger.error(f"Transcription error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error transcribing audio")
+        if response.status_code == 401:
+            raise HTTPException(status_code=401, detail="Unauthorized: Check your OpenAI API key")
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded: Please try again later")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Transcription request failed with status {response.status_code}",
+        )
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        logger.error("Transcription network error: %s", exc)
+        raise HTTPException(status_code=502, detail="Error reaching the transcription service")
     finally:
-        # Clean up the temporary file
-        if temp_file_path and os.path.exists(temp_file_path):
+        if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
             logger.info("Temporary audio file removed")
+
 
 def load_messages(session_id, role):
     session_file = f'sessions/{session_id}.json'
@@ -1060,12 +1168,10 @@ def get_chat_response(session_id: str, user_message: str, job_context: str):
         # Send request to Groq API
         try:
             logger.info(f"Sending request to Groq API for session {session_id}")
-            llm_response = client.chat.completions.create(
-                model="llama3-70b-8192",
-                messages=messages,
-                temperature=0.7,  # Add temperature for consistent responses
-                max_tokens=2000   # Limit response length
-            )
+            ai_response = complete_chat(messages, max_completion_tokens=2000)
+            logger.info(f"Received response from Groq API for session {session_id}: {ai_response[:100]}...")
+        except AIConfigurationError as e:
+            raise HTTPException(status_code=503, detail=str(e))
         except Exception as e:
             logger.error(f"Groq API error for session {session_id}: {str(e)}")
             raise HTTPException(
@@ -1073,14 +1179,9 @@ def get_chat_response(session_id: str, user_message: str, job_context: str):
                 detail="Failed to get response from AI service"
             )
 
-        # Process API response
-        try:
-            ai_response = llm_response.choices[0].message.content
-            logger.info(f"Received response from Groq API for session {session_id}: {ai_response[:100]}...")
-        except (AttributeError, IndexError) as e:
-            logger.error(f"Error processing Groq API response: {str(e)}")
+        if not ai_response:
             raise HTTPException(
-                status_code=500,
+                status_code=502,
                 detail="Invalid response format from AI service"
             )
 
@@ -1114,44 +1215,45 @@ def get_chat_response(session_id: str, user_message: str, job_context: str):
             detail="An unexpected error occurred while processing your request"
         )
 
-def text_to_speech(text):
-    url = "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB"
+def text_to_speech(text: str):
+    """Return (audio_bytes, media_type) for the interviewer prompt."""
+    if ai_stub_enabled() or not ELEVENLABS_API_KEY:
+        if ai_stub_enabled():
+            return tone_wav(), "audio/wav"
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY is not configured")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
+        "xi-api-key": ELEVENLABS_API_KEY,
     }
     data = {
         "text": text,
-        "model_id": "eleven_monolingual_v1",
+        "model_id": ELEVENLABS_MODEL_ID,
         "voice_settings": {
             "stability": 0.5,
             "similarity_boost": 0.5,
-            "style": 0.5,
-            "use_speaker_boost": True
-        }
+        },
     }
     try:
-        logger.info(f"Sending request to ElevenLabs API with text: {text[:100]}...")  # Log first 100 chars
-        response = requests.post(url, json=data, headers=headers)
-        logger.info(f"ElevenLabs API response status: {response.status_code}")
-        
+        logger.info("Sending request to ElevenLabs API with text: %s...", text[:100])
+        response = requests.post(url, json=data, headers=headers, timeout=120)
+        logger.info("ElevenLabs API response status: %s", response.status_code)
         if response.status_code == 200:
-            audio_content = response.content
-            logger.info(f"Received audio response, size: {len(audio_content)} bytes")
-            return audio_content
-        else:
-            error_message = f"ElevenLabs API error: {response.status_code}, Response: {response.text}"
-            logger.error(error_message)
-            raise Exception(error_message)
-    except requests.RequestException as e:
-        error_message = f"Network error in text-to-speech request: {str(e)}"
-        logger.error(error_message)
-        raise HTTPException(status_code=500, detail=error_message)
-    except Exception as e:
-        error_message = f"Unexpected error in text-to-speech: {str(e)}"
-        logger.error(error_message)
-        raise HTTPException(status_code=500, detail=error_message)
+            logger.info("Received audio response, size: %s bytes", len(response.content))
+            return response.content, "audio/mpeg"
+        logger.error("ElevenLabs API error: %s", response.status_code)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Text-to-speech failed with status {response.status_code}",
+        )
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        logger.error("Network error in text-to-speech request: %s", exc)
+        raise HTTPException(status_code=502, detail="Error reaching the text-to-speech service")
+
 
 def calculate_score(response):
     # Implement your scoring logic here
