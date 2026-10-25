@@ -455,6 +455,7 @@ async def analyze_response(
     role_family: str = "general",
     dimension: str | None = None,
     no_speech: bool = False,
+    job_text: str = "",
 ) -> Dict[str, Any]:
     """Score an answer and always return feedback plus improvement text."""
     if no_speech or not (response or "").strip() or response.strip().lower().startswith("the candidate did not speak"):
@@ -465,6 +466,9 @@ async def analyze_response(
     focus = dimension or "the dimension this question was meant to test"
     try:
         prompt = f"""Score this interview answer against the rubric. Use only the transcript.
+Judge it against the expectations of the role in the job description.
+Do not require coding, algorithms, system design, or implementation depth unless that job description is for a technical role such as a software engineer or developer.
+A product manager, salesperson, or other non-engineering candidate is not marked down for lacking code.
 If a dimension has no evidence in the answer, set it to null. Do not guess.
 Scores are 1 to 10. Anchors live at 2, 4, 6, 8, and 10.
 evidence is a short quote or close paraphrase from the answer that justifies the scores.
@@ -477,6 +481,9 @@ Role: {plan["role_label"]}
 Primary dimension for this question: {focus}
 Descriptors: {plan["descriptors"]}
 
+Job description:
+{(job_text or "")[:3000]}
+
 Question: {question}
 Response: {response}
 """
@@ -484,7 +491,10 @@ Response: {response}
             [
                 {
                     "role": "system",
-                    "content": "You are an expert interviewer. Return only the requested JSON object.",
+                    "content": (
+                        "You score an interview answer for the role in the job description. "
+                        "Do not assume the role is a software engineer. Return only the requested JSON object."
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -650,8 +660,9 @@ async def generate_interview_questions(jd_content: str, resume_content: str) -> 
         return get_default_questions()
     try:
         prompt = f"""Given the job description and resume below, generate EXACTLY 5 interview questions.
-Cover technical skills, past experience, problem solving, behavior, and cultural fit.
-question_type must be one of: technical, experience, problem-solving, behavioral, cultural-fit.
+Each question must fit the role in the job description and refer to a specific project, result, or experience from the resume that matches that role.
+Do not ask generic questions. Do not ask coding, algorithm, debugging, or implementation questions unless the job is a technical role such as a software engineer or developer.
+question_type must be one of: problem_solving, communication, role_knowledge, ownership, collaboration.
 key_points is a short string of 3-4 things to listen for.
 
 Job Description:
@@ -669,8 +680,9 @@ Resume:
                         {
                             "role": "system",
                             "content": (
-                                "You are an expert recruiter. Generate specific interview questions "
-                                "from the job description and resume. Return JSON only."
+                                "You write interview questions for the role in the job description. "
+                                "Use matching evidence from the resume. Do not default to software-engineering questions. "
+                                "Return JSON only."
                             ),
                         },
                         {"role": "user", "content": prompt},
@@ -703,46 +715,82 @@ def validate_question(question: Dict[str, Any]) -> bool:
         return False
     if len(question["question_text"]) < 10:
         return False
-    valid_types = {"technical", "experience", "problem-solving", "behavioral", "cultural-fit"}
+    valid_types = {
+        "technical",
+        "experience",
+        "problem-solving",
+        "behavioral",
+        "cultural-fit",
+        "problem_solving",
+        "communication",
+        "role_knowledge",
+        "ownership",
+        "collaboration",
+    }
     if question["question_type"].lower() not in valid_types:
         return False
     return True
 
 
-def get_default_questions() -> List[Dict[str, Any]]:
-    logger.info("Using default question set")
-    return [
-        {
-            "question_text": "Could you walk me through your most technically challenging project?",
-            "question_type": "technical",
-            "assesses": "Technical expertise and problem-solving",
-            "key_points": "Technical depth, problem approach, solution implementation, results achieved",
-        },
-        {
-            "question_text": "Describe a situation where you had to learn a new technology quickly. How did you approach it?",
-            "question_type": "experience",
-            "assesses": "Learning ability and adaptability",
-            "key_points": "Learning strategy, time management, practical application, outcome",
-        },
-        {
-            "question_text": "Tell me about a time when you had to resolve a complex technical issue under tight deadlines.",
-            "question_type": "problem-solving",
-            "assesses": "Critical thinking and pressure handling",
-            "key_points": "Problem analysis, solution approach, time management, result",
-        },
-        {
-            "question_text": "How do you handle disagreements with team members about technical decisions?",
-            "question_type": "behavioral",
-            "assesses": "Conflict resolution and teamwork",
-            "key_points": "Communication style, conflict resolution approach, team collaboration, outcome",
-        },
-        {
-            "question_text": "What aspects of our company's tech stack and culture interest you the most?",
-            "question_type": "cultural-fit",
-            "assesses": "Company culture alignment and technical interest",
-            "key_points": "Company research, technical knowledge, cultural values, motivation",
-        },
-    ]
+def _resume_hint(resume_content: str) -> str:
+    for raw_line in (resume_content or "").replace("\r", "\n").split("\n"):
+        line = " ".join(raw_line.strip().split())
+        if len(line) < 8:
+            continue
+        if "@" in line and " " not in line:
+            continue
+        if len(line) > 80:
+            line = line[:80].rsplit(" ", 1)[0].strip()
+        return line
+    return ""
+
+
+def fallback_question(
+    role_label: str,
+    dimension: str,
+    main_index: int,
+    resume_content: str = "",
+) -> Dict[str, Any]:
+    """A role-shaped question used when the model is unavailable. Never a coding prompt."""
+    role = (role_label or "this role").strip() or "this role"
+    hint = _resume_hint(resume_content).strip().rstrip(".")
+    evidence = f" Draw on this from their background if it matches the role: {hint}." if hint else ""
+    prompts = {
+        "problem_solving": (
+            f"Describe an unclear problem you handled in work like a {role}. "
+            f"How did you choose what to do, and how did you know it worked?{evidence}"
+        ),
+        "communication": (
+            f"Tell me about a time you had to explain a difficult point to someone outside your day-to-day work as a {role}. "
+            f"How did you make it clear?{evidence}"
+        ),
+        "role_knowledge": (
+            f"Walk through one example from your experience that best matches what a {role} is hired to do, and the result.{evidence}"
+        ),
+        "ownership": (
+            f"Tell me about a result you personally drove in work like a {role}. What did you decide, and what changed because of it?{evidence}"
+        ),
+        "collaboration": (
+            f"Describe a time you depended on other people to deliver something as a {role}. Where did you disagree, and what happened?{evidence}"
+        ),
+    }
+    text = prompts.get(dimension) or (
+        f"Tell me about work you have done that matches a {role} role, including what you personally did and the result.{evidence}"
+    )
+    return {
+        "question_text": text,
+        "question_type": dimension,
+        "assesses": dimension,
+        "key_points": "A specific example, the candidate's own actions, and a result",
+        "dimension": dimension,
+        "main_index": main_index,
+    }
+
+
+def get_default_questions(role_label: str = "this role", resume_content: str = "") -> List[Dict[str, Any]]:
+    logger.info("Using role-shaped fallback questions")
+    dimensions = ["problem_solving", "communication", "role_knowledge", "ownership", "collaboration"]
+    return [fallback_question(role_label, dimension, index, resume_content) for index, dimension in enumerate(dimensions, 1)]
 
 
 def _fallback_follow_up(reason: str) -> str:
@@ -794,33 +842,45 @@ async def generate_next_main_question(
     """One main question, chosen from the job, the resume, and answers so far."""
     dimension = next_dimension(role_family, covered, main_index)
     plan = rubric_for(role_family)
+    shaped = fallback_question(plan["role_label"], dimension, main_index, resume_content)
     if ai_stub_enabled() or not GROQ_API_KEY:
-        base = get_default_questions()[(main_index - 1) % 5]
-        return {
-            **base,
-            "dimension": dimension,
-            "question_type": dimension,
-            "main_index": main_index,
-        }
+        return shaped
     prior = "\n".join(
         f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}" for item in history
     ) or "No answers yet."
+    technical_role = plan["role_family"] in {"software_developer", "forward_deployed_engineer"}
+    if technical_role:
+        technical_rule = (
+            "This role is technical. You may ask about implementation only when both the job description "
+            "and the resume show that work."
+        )
+    else:
+        technical_rule = (
+            "This role is not a coding role. Do not ask coding, algorithm, debugging, system-design, "
+            "or technical-implementation questions."
+        )
     try:
         raw = complete_chat(
             [
                 {
                     "role": "system",
                     "content": (
-                        "You write one interview question. Return JSON with question_text, "
-                        "question_type, assesses, and key_points."
+                        "You write one interview question for the role in the job description. "
+                        "Use a specific matching detail from the resume. "
+                        "Do not default to a software-engineering question. "
+                        "Return JSON with question_text, question_type, assesses, and key_points."
                     ),
                 },
                 {
                     "role": "user",
                     "content": (
-                        f"Role family: {plan['role_label']}.\n"
-                        f"This question should probe {dimension}: {plan['descriptors'][dimension]}\n"
-                        f"Do not repeat a question already asked.\n\n"
+                        f"Role: {plan['role_label']}.\n"
+                        f"Ask one question that tests {dimension}: {plan['descriptors'][dimension]}\n"
+                        f"{technical_rule}\n"
+                        "The question must combine what the role requires with a project, result, or experience from the resume.\n"
+                        "Do not ask a generic question such as 'tell me about yourself' or 'what is your greatest weakness'.\n"
+                        "Do not repeat a question already asked.\n"
+                        f"question_type must be {dimension}.\n\n"
                         f"Job description:\n{jd_content[:4000]}\n\n"
                         f"Resume:\n{resume_content[:4000]}\n\n"
                         f"So far:\n{prior}"
@@ -833,10 +893,10 @@ async def generate_next_main_question(
         )
         payload = _try_json(raw) or {}
         questions = _questions_from_payload(payload) or parse_generated_questions(raw)
-        chosen = questions[0] if questions else get_default_questions()[(main_index - 1) % 5]
+        chosen = questions[0] if questions else shaped
     except Exception as exc:
         logger.error("Next question generation failed: %s", exc)
-        chosen = get_default_questions()[(main_index - 1) % 5]
+        chosen = shaped
     chosen = dict(chosen)
     chosen["dimension"] = dimension
     chosen["question_type"] = dimension

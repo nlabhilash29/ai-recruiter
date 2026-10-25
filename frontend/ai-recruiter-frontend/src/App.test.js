@@ -37,6 +37,10 @@ test("candidate tab stacks the interview link and expands practice", () => {
   expect(screen.getByRole("heading", { name: /start an interview/i })).toBeInTheDocument();
   expect(screen.queryByLabelText(/^role$/i)).not.toBeInTheDocument();
   expect(screen.queryByLabelText(/job description/i)).not.toBeInTheDocument();
+  const open = screen.getByRole("button", { name: /^start$/i });
+  expect(open).toBeDisabled();
+  fireEvent.change(screen.getByLabelText(/your name/i), { target: { value: "Ada" } });
+  expect(open).toBeDisabled();
   fireEvent.click(screen.getByRole("link", { name: /do you want to practice first\? click here\./i }));
   const start = screen.getByRole("button", { name: /start practice/i });
   expect(start).toBeDisabled();

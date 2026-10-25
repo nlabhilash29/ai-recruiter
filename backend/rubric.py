@@ -74,44 +74,15 @@ ROLE_LABELS = {
     "general": "General",
 }
 
-# What "strong" looks like in this role. Shown to the model and on the report.
-ROLE_DESCRIPTORS = {
-    "software_developer": {
-        "problem_solving": "Breaks a technical problem into constraints, options, and a checkable result.",
-        "communication": "Explains a design or debugging path so another engineer could follow it.",
-        "role_knowledge": "Shows accurate depth in the languages, systems, or tools the role uses.",
-        "ownership": "Names the part they personally shipped and a measured result.",
-        "collaboration": "Describes how they worked with teammates on a technical decision.",
-    },
-    "forward_deployed_engineer": {
-        "problem_solving": "Turns a messy customer problem into a scoped technical plan.",
-        "communication": "Explains tradeoffs in language a customer and an engineer can both use.",
-        "role_knowledge": "Connects the product's capabilities to the customer's environment.",
-        "ownership": "Describes what they drove to deployment and how the customer outcome changed.",
-        "collaboration": "Works across the customer, support, and product without dropping context.",
-    },
-    "product_manager": {
-        "problem_solving": "Frames a user problem, options, and how they would know the choice worked.",
-        "communication": "Makes the goal, the constraint, and the ask unmistakable.",
-        "role_knowledge": "Shows judgment about users, priorities, and how the product actually works.",
-        "ownership": "Points to a decision they made and the outcome they measured.",
-        "collaboration": "Brings engineering, design, or go-to-market along without hiding disagreement.",
-    },
-    "sales": {
-        "problem_solving": "Diagnoses a buyer's real problem before pitching.",
-        "communication": "Is specific, concise, and easy for a buyer to repeat internally.",
-        "role_knowledge": "Knows the product, the buyer, and the competitive alternative.",
-        "ownership": "Owns a number, a deal, or a motion and can say what moved it.",
-        "collaboration": "Uses the team (product, solutions, leadership) without disappearing.",
-    },
-    "general": {
-        "problem_solving": "Structures an unfamiliar problem and checks the result.",
-        "communication": "Is clear, sequenced, and concrete.",
-        "role_knowledge": "Shows real skill in the work the job description describes.",
-        "ownership": "Separates what they did from what the team did, and names a result.",
-        "collaboration": "Works with other people and handles disagreement.",
-    },
+# One description per dimension, for every role. The job description says what the work is.
+GENERIC_DESCRIPTORS = {
+    "problem_solving": "Turns an unclear situation into options, chooses one, and says how they would know it worked.",
+    "communication": "Makes the point easy to follow and backs it with a concrete example.",
+    "role_knowledge": "Shows sound judgment about the work this role actually does.",
+    "ownership": "Names what they personally decided or did, and the result that followed.",
+    "collaboration": "Works with the other people the role depends on and handles disagreement without losing the goal.",
 }
+ROLE_DESCRIPTORS = {family: GENERIC_DESCRIPTORS for family in ROLE_WEIGHTS}
 
 # Shared 1–10 anchors. The role descriptor says what "the work" means.
 ANCHORS = {
@@ -134,7 +105,7 @@ ANCHORS = {
         4: "Surface familiarity, without enough accuracy to trust on the job.",
         6: "Correct on the core of the topic the question asked.",
         8: "Accurate and specific, including a limit or edge of that knowledge.",
-        10: "Depth a peer would rely on, tied to the tools or domain in the job description.",
+        10: "Depth a peer in this role would rely on, tied to the work in the job description.",
     },
     "ownership": {
         2: "No personal action, or the result is only a slogan.",

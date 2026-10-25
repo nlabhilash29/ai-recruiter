@@ -106,6 +106,7 @@ class InterviewFlowTests(unittest.TestCase):
         created = self.client.post(
             "/mock-interview",
             data={
+                "candidate_name": "Alex Rivera",
                 "jd_text": "Job Title: Backend Engineer\nCompany: Example\nBuild reliable APIs.",
                 "resume_text": "Alex Rivera\nalex@example.com\nBackend engineer who ships APIs.",
             },

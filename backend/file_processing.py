@@ -292,6 +292,40 @@ def extract_job_details(content: str) -> Dict[str, str]:
         "company": company or "Unknown Company",
     }
 
+
+def short_role_title(content: str, fallback: str = "Role") -> str:
+    """A role title short enough for a list row, never the whole job description."""
+    text = (content or "").replace("\r", "\n").strip()
+    if not text:
+        return fallback
+    extracted = (extract_job_details(text).get("title") or "").strip()
+    if extracted and extracted.lower() not in {"untitled position", "practice role"} and len(extracted) <= 60:
+        return _clip_title(extracted)
+    first = ""
+    for raw_line in text.split("\n"):
+        line = raw_line.strip().lstrip("#").strip()
+        line = re.sub(r"^(job title|position|role|title)\s*[:\-]\s*", "", line, flags=re.IGNORECASE).strip()
+        if len(line) >= 2:
+            first = line
+            break
+    if not first:
+        first = text
+    # A pasted JD is often one paragraph. The role is the first sentence, not the rest of the brief.
+    sentence = re.split(r"(?<=[.!?])\s+", first, maxsplit=1)[0].strip().strip(".")
+    if len(sentence) >= 2:
+        return _clip_title(sentence)
+    return _clip_title(first) or fallback
+
+
+def _clip_title(value: str, limit: int = 60) -> str:
+    compact = " ".join((value or "").split())
+    if len(compact) <= limit:
+        return compact
+    cut = compact[:limit].rsplit(" ", 1)[0].strip(" -–—,.;:")
+    if len(cut) < 12:
+        cut = compact[:limit].strip()
+    return cut
+
 def extract_candidate_info(content: str) -> Dict[str, str]:
     """
     Extract candidate name and email from resume content

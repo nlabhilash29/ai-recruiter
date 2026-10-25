@@ -13,20 +13,12 @@ import {
 import ColdStart from "../components/ColdStart";
 import CopyButton from "../components/CopyButton";
 
-const STATUSES = [
-  { value: "", label: "All statuses" },
-  { value: "draft", label: "Draft" },
-  { value: "ready", label: "Ready" },
-  { value: "in_progress", label: "In progress" },
-  { value: "completed", label: "Completed" },
-];
-
 const FALLBACK_EVALUATION = [
-  { id: "problem_solving", label: "Problem solving", description: "Structures an unfamiliar problem and checks the result." },
-  { id: "communication", label: "Communication", description: "Is clear, sequenced, and concrete." },
-  { id: "role_knowledge", label: "Role knowledge", description: "Shows real skill in the work the job description describes." },
-  { id: "ownership", label: "Ownership and impact", description: "Separates what they did from what the team did, and names a result." },
-  { id: "collaboration", label: "Collaboration", description: "Works with other people and handles disagreement." },
+  { id: "problem_solving", label: "Problem solving", description: "Turns an unclear situation into options, chooses one, and says how they would know it worked." },
+  { id: "communication", label: "Communication", description: "Makes the point easy to follow and backs it with a concrete example." },
+  { id: "role_knowledge", label: "Role knowledge", description: "Shows sound judgment about the work this role actually does." },
+  { id: "ownership", label: "Ownership and impact", description: "Names what they personally decided or did, and the result that followed." },
+  { id: "collaboration", label: "Collaboration", description: "Works with the other people the role depends on and handles disagreement without losing the goal." },
 ];
 
 export default function RecruiterPage() {
@@ -46,7 +38,6 @@ export default function RecruiterPage() {
   const [formError, setFormError] = useState("");
 
   const [query, setQuery] = useState("");
-  const [status, setStatus] = useState("");
   const [interviews, setInterviews] = useState([]);
   const [listReady, setListReady] = useState(false);
   const [listError, setListError] = useState("");
@@ -73,7 +64,7 @@ export default function RecruiterPage() {
     try {
       const response = await axios.get(`${API_URL}/interview/search`, {
         headers: authHeaders(),
-        params: { q: query || undefined, status: status || undefined },
+        params: { q: query || undefined, status: "completed" },
         timeout: 90000,
       });
       setInterviews(Array.isArray(response.data) ? response.data : []);
@@ -92,7 +83,7 @@ export default function RecruiterPage() {
       if (error.response?.status === 503) setSetupMessage(message);
       else setListError(message);
     }
-  }, [query, status]);
+  }, [query]);
 
   useEffect(() => {
     if (signedIn) loadInterviews();
@@ -250,44 +241,24 @@ export default function RecruiterPage() {
 
       <section className="card">
         <h2>View candidate reports</h2>
-        <div className="split">
-          <div>
-            <label htmlFor="interview-search">Search</label>
-            <input
-              id="interview-search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Name, role, or link"
-            />
-          </div>
-          <div>
-            <label htmlFor="status-filter">Status</label>
-            <select id="status-filter" value={status} onChange={(event) => setStatus(event.target.value)}>
-              {STATUSES.map((item) => (
-                <option key={item.value || "all"} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <label htmlFor="interview-search">Search</label>
+        <input
+          id="interview-search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Name, role, or link"
+        />
         {listError ? <div className="alert alert-error">{listError}</div> : null}
         {listReady && interviews.length === 0 ? <p className="empty-state">No reports match this view yet.</p> : null}
         <ul className="interview-list">
-          {interviews.map((interview) => {
+          {interviews.filter((interview) => interview.status === "completed").map((interview) => {
             const score = formatScore(interview.overall_score);
+            const title = [interview.candidate_name || "Candidate", interview.job_title || "Role"].join(" · ");
             return (
               <li key={interview.interview_id}>
                 <div>
-                  <strong>{interview.candidate_name || "Candidate"}</strong>
-                  <p>
-                    {interview.job_title || "Role"}
-                    {interview.company ? ` · ${interview.company}` : ""}
-                  </p>
-                  <p className="muted">
-                    <span className={`pill pill-${interview.status}`}>{interview.status}</span>
-                    {interview.status === "completed" && score ? ` · ${score}/10` : ""}
-                  </p>
+                  <strong>{title}</strong>
+                  {score ? <p className="muted">{score}/10</p> : null}
                 </div>
                 <div className="controls">
                   <Link className="btn btn-secondary" to={`/recruiter/interviews/${interview.interview_id}`}>

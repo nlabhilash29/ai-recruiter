@@ -3,8 +3,10 @@ import unittest
 
 os.environ.setdefault("AI_STUB", "1")
 
+from question_generation import fallback_question
 from rubric import (
     DIMENSIONS,
+    GENERIC_DESCRIPTORS,
     ROLE_WEIGHTS,
     aggregate,
     follow_up_reason,
@@ -63,6 +65,29 @@ class RubricTests(unittest.TestCase):
             "interesting",
         )
         self.assertIsNone(follow_up_reason("", {"not_assessed": True, "relevance_score": 1}))
+
+    def test_dimension_descriptions_are_role_generic(self):
+        banned = ("coding", "code", "algorithm", "engineer", "technical", "debug")
+        for role in ROLE_WEIGHTS:
+            descriptors = rubric_for(role)["descriptors"]
+            self.assertEqual(descriptors, GENERIC_DESCRIPTORS)
+            for text in descriptors.values():
+                lowered = text.lower()
+                for word in banned:
+                    self.assertNotIn(word, lowered)
+
+    def test_fallback_questions_follow_the_role_not_a_coding_script(self):
+        question = fallback_question(
+            "Product Manager",
+            "role_knowledge",
+            1,
+            "I shipped a checkout rewrite with design and engineering.",
+        )
+        text = question["question_text"].lower()
+        self.assertIn("product manager", text)
+        self.assertIn("checkout", text)
+        for word in ("algorithm", "coding", "tech stack", "technically challenging"):
+            self.assertNotIn(word, text)
 
 
 if __name__ == "__main__":

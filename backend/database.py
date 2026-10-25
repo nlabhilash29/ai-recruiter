@@ -17,6 +17,7 @@ _ADDED_COLUMNS = {
         "question_mode": "VARCHAR(32) DEFAULT 'preset'",
         "main_question_target": "INTEGER DEFAULT 5",
         "role_family": "VARCHAR(64)",
+        "candidate_display_name": "VARCHAR(80)",
         "rubric": "TEXT",
         "dimension_scores": "TEXT",
         "recommendation": "TEXT",

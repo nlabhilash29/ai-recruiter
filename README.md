@@ -25,18 +25,18 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 **Candidate interview**
 
-- The Candidate tab is a single stacked page: paste an interview link and start, or open “Do you want to practice first? Click here.” Practice asks for a job description and a resume, then runs a 5-question sample. A direct `/interview/:id` link skips that page.
+- The Candidate tab asks for a name, then an interview link, or “Do you want to practice first? Click here.” Practice asks for a job description and a resume. A direct `/interview/:id` link skips that page.
 - Deep links stay at `/interview/:id`.
 - Microphone and camera check, including a short room-noise calibration. Only audio is recorded and transcribed. The camera is a framing preview and is not uploaded.
 - One **Begin interview** click unlocks audio. After that there are no Start, Stop, Re-record, or Submit buttons. The interviewer speaks, then listens. About 2.8 seconds of silence after speech ends the answer. A live microphone level, "Listening…", and "Moving on in 2…" keep the state obvious. Resumed speech cancels the countdown.
-- No speech for about 15 seconds replays the question once, then moves on without a score. Answers stop before the 5 MB upload limit. "I'm done answering" is a small text fallback.
+- No speech for about 15 seconds replays the question once, then moves on without a score. Answers stop before the 5 MB upload limit. After the last answer the interviewer says goodbye, and a Go back button returns to the Candidate tab.
 - Every new interview is five AI-generated questions. "Question X of 5" counts those questions. Older interviews that stored a different count or a fixed list still play.
 
 **Recruiter area**
 
 - Two tabs only, in this order: Recruiter (the default) and Candidate. The recruiter page pastes a job description and a resume, then shows an interview link to copy. It does not start the interview, and it does not wait on the access check before rendering. Questions are generated only when both documents are present.
 - Open by default. Set `RECRUITER_AUTH_REQUIRED=true` to require `RECRUITER_PASSCODE`. The passcode alone does not lock the desk.
-- **View candidate reports** lists interviews with search and a status filter.
+- **View candidate reports** lists completed interviews, titled with the candidate's name and a short role title.
 - The role used for rubric weights is inferred from the job description and resume. There is no role picker and no question-count or preset-question control.
 
 **Results**

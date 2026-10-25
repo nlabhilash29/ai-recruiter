@@ -15,6 +15,7 @@ function interviewIdFromInput(value) {
 export default function HomePage() {
   const navigate = useNavigate();
   const [existingId, setExistingId] = useState("");
+  const [candidateName, setCandidateName] = useState("");
   const [jdText, setJdText] = useState("");
   const [resumeText, setResumeText] = useState("");
   const [practiceOpen, setPracticeOpen] = useState(() => window.location.hash === "#practice");
@@ -29,14 +30,31 @@ export default function HomePage() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  function openExisting(event) {
+  async function openExisting(event) {
     event.preventDefault();
     const interviewId = interviewIdFromInput(existingId);
+    if (!candidateName.trim()) {
+      setError("Enter your name.");
+      return;
+    }
     if (!interviewId) {
       setError("Paste an interview link to open it.");
       return;
     }
-    navigate(`/interview/${interviewId}`);
+    setLoading(true);
+    setError("");
+    try {
+      const form = new URLSearchParams();
+      form.append("candidate_name", candidateName.trim());
+      await axios.post(`${API_URL}/interview/${interviewId}/candidate`, form, {
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        timeout: 90000,
+      });
+      navigate(`/interview/${interviewId}`);
+    } catch (requestError) {
+      setError(friendlyError(requestError, "That interview link could not be opened."));
+      setLoading(false);
+    }
   }
 
   function revealPractice(event) {
@@ -49,6 +67,10 @@ export default function HomePage() {
 
   async function createPractice(event) {
     event.preventDefault();
+    if (!candidateName.trim()) {
+      setError("Enter your name.");
+      return;
+    }
     if (!jdText.trim() || !resumeText.trim()) {
       setError("A job description and a resume are both required.");
       return;
@@ -57,6 +79,7 @@ export default function HomePage() {
     setError("");
     try {
       const form = new URLSearchParams();
+      form.append("candidate_name", candidateName.trim());
       form.append("jd_text", jdText.trim());
       form.append("resume_text", resumeText.trim());
       const response = await axios.post(`${API_URL}/mock-interview`, form, {
@@ -70,7 +93,7 @@ export default function HomePage() {
     }
   }
 
-  const canPractice = Boolean(jdText.trim() && resumeText.trim());
+  const canPractice = Boolean(candidateName.trim() && jdText.trim() && resumeText.trim());
 
   return (
     <div className="page narrow">
@@ -81,14 +104,24 @@ export default function HomePage() {
       <section>
         <h2>Start an interview</h2>
         <form onSubmit={openExisting}>
+          <label htmlFor="candidate-name">Your name</label>
+          <input
+            id="candidate-name"
+            value={candidateName}
+            onChange={(event) => setCandidateName(event.target.value)}
+            placeholder="Your name"
+            autoComplete="name"
+            disabled={loading}
+          />
           <label htmlFor="existing-id">Interview link</label>
           <input
             id="existing-id"
             value={existingId}
             onChange={(event) => setExistingId(event.target.value)}
             placeholder="Paste the interview link"
+            disabled={loading}
           />
-          <button className="btn btn-primary" type="submit" disabled={!existingId.trim()}>
+          <button className="btn btn-primary" type="submit" disabled={loading || !candidateName.trim() || !existingId.trim()}>
             Start
           </button>
         </form>

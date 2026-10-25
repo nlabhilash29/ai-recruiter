@@ -73,6 +73,7 @@ class InterviewSession(Base):
     question_mode = Column(String(32), default="dynamic")  # dynamic or preset
     main_question_target = Column(Integer, default=5)
     role_family = Column(String(64), nullable=True)
+    candidate_display_name = Column(String(80), nullable=True)
     rubric = Column(JSON, nullable=True)
     dimension_scores = Column(JSON, nullable=True)
     recommendation = Column(Text, nullable=True)

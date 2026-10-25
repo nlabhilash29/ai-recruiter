@@ -201,6 +201,7 @@ class RecruiterDocumentFlowTests(unittest.TestCase):
 
 def practice_documents(**overrides):
     data = {
+        "candidate_name": "Alex Rivera",
         "jd_text": "Job Title: Frontend Engineer\nCompany: Example\nBuild user interfaces.",
         "resume_text": "Alex Rivera\nalex@example.com\nFrontend engineer who ships UI.",
     }
@@ -235,7 +236,7 @@ class InterviewLoopTests(unittest.TestCase):
         self.assertEqual(details.status_code, 200, details.text)
         body = details.json()
         self.assertEqual(body["status"], "completed")
-        self.assertEqual(body["candidate"]["name"], "Mock Candidate")
+        self.assertEqual(body["candidate"]["name"], "Alex Rivera")
         self.assertEqual(len(body["questions"]), 5)
         self.assertTrue(all(question["responses"] for question in body["questions"]))
         self.assertGreater(body["scoring"]["cultural_fit_score"], 0)
@@ -284,6 +285,7 @@ class InterviewLoopTests(unittest.TestCase):
                 "job_role": "",
                 "jd_text": "Product manager for the checkout team. Prioritize the roadmap.",
                 "resume_text": "I shipped a checkout rewrite with design and engineering.",
+                "candidate_name": "Ada Lovelace",
                 "question_mode": "preset",
                 "main_question_target": "8",
                 "role_family": "sales",
@@ -295,6 +297,65 @@ class InterviewLoopTests(unittest.TestCase):
         self.assertEqual(created.json()["role_family"], "product_manager")
         self.assertEqual(len(created.json()["questions"]), 1)
         self.assertEqual(len(created.json()["evaluation"]), 5)
+
+    def test_candidate_name_and_short_role_title(self):
+        long_jd = (
+            "We are hiring a product manager who will own the checkout roadmap and work with "
+            "design and engineering every day to ship the right things for customers across the company."
+        )
+        missing_name = client.post(
+            "/mock-interview",
+            data={"jd_text": long_jd, "resume_text": "I shipped a checkout rewrite."},
+        )
+        self.assertEqual(missing_name.status_code, 400)
+        self.assertIn("name", missing_name.json()["detail"].lower())
+
+        created = client.post(
+            "/mock-interview",
+            data={
+                "candidate_name": "Ada Lovelace",
+                "jd_text": long_jd,
+                "resume_text": "I shipped a checkout rewrite with design and engineering.",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertLessEqual(len(created.json()["job_title"]), 60)
+        self.assertNotIn("engineering every day", created.json()["job_title"])
+        interview_id = created.json()["interview_id"]
+        report = client.get(f"/interview/{interview_id}/results")
+        self.assertEqual(report.status_code, 200, report.text)
+        self.assertEqual(report.json()["candidate"]["name"], "Ada Lovelace")
+        self.assertLessEqual(len(report.json()["job_description"]["title"]), 60)
+
+        headers = auth_headers()
+        recruiter = client.post(
+            "/interview/create",
+            headers=headers,
+            data={
+                "jd_text": "Job Title: Backend Engineer\nCompany: Example Corp\nBuild reliable APIs.",
+                "resume_text": "Name missing on the resume body.",
+            },
+        )
+        self.assertEqual(recruiter.status_code, 200, recruiter.text)
+        named = client.post(
+            f"/interview/{recruiter.json()['interview_id']}/candidate",
+            data={"candidate_name": "Grace Hopper"},
+        )
+        self.assertEqual(named.status_code, 200, named.text)
+        session = client.get(f"/interview/{recruiter.json()['interview_id']}/session")
+        self.assertEqual(session.json()["candidate_name"], "Grace Hopper")
+        self.assertEqual(session.json()["job_title"], "Backend Engineer")
+
+        sentence = client.post(
+            "/mock-interview",
+            data={
+                "candidate_name": "Ada Lovelace",
+                "jd_text": "Product manager for the checkout team. Own the roadmap and prioritize experiments with design.",
+                "resume_text": "Led a checkout redesign that raised completion.",
+            },
+        )
+        self.assertEqual(sentence.status_code, 200, sentence.text)
+        self.assertEqual(sentence.json()["job_title"], "Product manager for the checkout team")
 
     def test_practice_and_create_require_both_documents(self):
         role_only = client.post("/mock-interview", data={"job_role": "Frontend Engineer"})
