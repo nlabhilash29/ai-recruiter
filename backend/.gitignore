@@ -39,6 +39,9 @@ temp/*
 !temp/.gitkeep
 uploads/*
 !uploads/.gitkeep
+jd_uploads/
+resume_uploads/
+database.json
 
 # Logs
 *.log
