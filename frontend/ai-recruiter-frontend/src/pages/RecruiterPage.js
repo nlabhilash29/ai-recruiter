@@ -10,6 +10,7 @@ import {
   getRecruiterToken,
   setRecruiterToken,
 } from "../api";
+import ColdStart from "../components/ColdStart";
 import CopyButton from "../components/CopyButton";
 
 const STATUSES = [
@@ -29,15 +30,15 @@ const FALLBACK_EVALUATION = [
 ];
 
 export default function RecruiterPage() {
-  const [access, setAccess] = useState(null);
+  const [access, setAccess] = useState({ auth_required: false });
   const [token, setToken] = useState(getRecruiterToken());
   const [passcode, setPasscode] = useState("");
   const [authError, setAuthError] = useState("");
   const [setupMessage, setSetupMessage] = useState("");
   const [signingIn, setSigningIn] = useState(false);
 
-  const [jdFile, setJdFile] = useState(null);
-  const [resumeFile, setResumeFile] = useState(null);
+  const [jdText, setJdText] = useState("");
+  const [resumeText, setResumeText] = useState("");
   const [interviewId, setInterviewId] = useState("");
   const [evaluation, setEvaluation] = useState([]);
   const [ready, setReady] = useState(false);
@@ -47,6 +48,7 @@ export default function RecruiterPage() {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState("");
   const [interviews, setInterviews] = useState([]);
+  const [listReady, setListReady] = useState(false);
   const [listError, setListError] = useState("");
 
   const authRequired = Boolean(access?.auth_required);
@@ -74,7 +76,8 @@ export default function RecruiterPage() {
         params: { q: query || undefined, status: status || undefined },
         timeout: 90000,
       });
-      setInterviews(response.data || []);
+      setInterviews(Array.isArray(response.data) ? response.data : []);
+      setListReady(true);
       setListError("");
       setSetupMessage("");
     } catch (error) {
@@ -92,8 +95,8 @@ export default function RecruiterPage() {
   }, [query, status]);
 
   useEffect(() => {
-    if (signedIn && access) loadInterviews();
-  }, [signedIn, access, loadInterviews]);
+    if (signedIn) loadInterviews();
+  }, [signedIn, loadInterviews]);
 
   async function signIn(event) {
     event.preventDefault();
@@ -120,22 +123,10 @@ export default function RecruiterPage() {
     setInterviews([]);
   }
 
-  function onFile(event, setter) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    if (file.size > 5 * 1024 * 1024) {
-      setFormError("That file is too large. Please keep it under 5 MB.");
-      event.target.value = "";
-      return;
-    }
-    setter(file);
-    setFormError("");
-  }
-
   async function createInterview(event) {
     event.preventDefault();
-    if (!jdFile || !resumeFile) {
-      setFormError("Choose both a job description and a resume.");
+    if (!jdText.trim() || !resumeText.trim()) {
+      setFormError("A job description and a resume are both required.");
       return;
     }
     setBusy(true);
@@ -143,15 +134,9 @@ export default function RecruiterPage() {
     setReady(false);
     try {
       const headers = authHeaders();
-      const jdData = new FormData();
-      jdData.append("file", jdFile);
-      const resumeData = new FormData();
-      resumeData.append("file", resumeFile);
-      const jdResponse = await axios.post(`${API_URL}/upload/jd`, jdData, { headers, timeout: 120000 });
-      const resumeResponse = await axios.post(`${API_URL}/upload/resume`, resumeData, { headers, timeout: 120000 });
       const form = new URLSearchParams();
-      form.append("jd_id", jdResponse.data.jd_id);
-      form.append("resume_id", resumeResponse.data.resume_id);
+      form.append("jd_text", jdText.trim());
+      form.append("resume_text", resumeText.trim());
       const created = await axios.post(`${API_URL}/interview/create`, form, {
         headers: { ...headers, "Content-Type": "application/x-www-form-urlencoded" },
         timeout: 120000,
@@ -165,14 +150,6 @@ export default function RecruiterPage() {
     } finally {
       setBusy(false);
     }
-  }
-
-  if (!access) {
-    return (
-      <div className="page narrow">
-        <p className="card">Opening the recruiter desk…</p>
-      </div>
-    );
   }
 
   if (!signedIn) {
@@ -206,8 +183,11 @@ export default function RecruiterPage() {
   const shareLink = interviewId ? candidateLink(interviewId) : "";
   const dimensions = evaluation.length ? evaluation : FALLBACK_EVALUATION;
 
+  const canCreate = Boolean(jdText.trim() && resumeText.trim());
+
   return (
     <div className="page">
+      <ColdStart active={busy} />
       <div className="interview-top">
         <div>
           <p className="eyebrow">Recruiter</p>
@@ -226,17 +206,23 @@ export default function RecruiterPage() {
 
       <form className="card" onSubmit={createInterview}>
         <h2>New interview</h2>
-        <div className="split">
-          <div>
-            <label htmlFor="jd-file">Job description</label>
-            <input id="jd-file" type="file" accept=".pdf,.docx,.txt" onChange={(event) => onFile(event, setJdFile)} disabled={busy} />
-          </div>
-          <div>
-            <label htmlFor="resume-file">Resume</label>
-            <input id="resume-file" type="file" accept=".pdf,.docx,.txt" onChange={(event) => onFile(event, setResumeFile)} disabled={busy} />
-          </div>
-        </div>
-        <button className="btn btn-primary" type="submit" disabled={busy || !jdFile || !resumeFile}>
+        <label htmlFor="jd-text">Job description</label>
+        <textarea
+          id="jd-text"
+          value={jdText}
+          onChange={(event) => setJdText(event.target.value)}
+          placeholder="Paste the job description"
+          disabled={busy}
+        />
+        <label htmlFor="resume-text">Resume</label>
+        <textarea
+          id="resume-text"
+          value={resumeText}
+          onChange={(event) => setResumeText(event.target.value)}
+          placeholder="Paste the resume"
+          disabled={busy}
+        />
+        <button className="btn btn-primary" type="submit" disabled={busy || !canCreate}>
           {busy ? "Working…" : "Create interview"}
         </button>
       </form>
@@ -286,7 +272,7 @@ export default function RecruiterPage() {
           </div>
         </div>
         {listError ? <div className="alert alert-error">{listError}</div> : null}
-        {interviews.length === 0 ? <p className="empty-state">No reports match this view yet.</p> : null}
+        {listReady && interviews.length === 0 ? <p className="empty-state">No reports match this view yet.</p> : null}
         <ul className="interview-list">
           {interviews.map((interview) => {
             const score = formatScore(interview.overall_score);

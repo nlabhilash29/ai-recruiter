@@ -103,7 +103,13 @@ class InterviewFlowTests(unittest.TestCase):
                 os.environ["RECRUITER_AUTH_REQUIRED"] = previous_flag
 
     def test_mock_interview_answer_and_report(self):
-        created = self.client.post("/mock-interview", data={"job_role": "Backend Engineer"})
+        created = self.client.post(
+            "/mock-interview",
+            data={
+                "jd_text": "Job Title: Backend Engineer\nCompany: Example\nBuild reliable APIs.",
+                "resume_text": "Alex Rivera\nalex@example.com\nBackend engineer who ships APIs.",
+            },
+        )
         self.assertEqual(created.status_code, 200, created.text)
         interview_id = created.json()["interview_id"]
 

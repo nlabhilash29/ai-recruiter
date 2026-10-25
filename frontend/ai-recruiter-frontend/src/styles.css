@@ -47,6 +47,17 @@
 
 .nav a:hover, .text-link:hover { background: rgba(52, 152, 219, 0.12); }
 
+.nav a[aria-current="page"] { background: rgba(52, 152, 219, 0.16); }
+
+.plain-link {
+  color: var(--blue-deep);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.plain-link:hover { background: none; }
+
 .github-link { margin-left: auto; display: inline-flex; }
 
 .github-link img {
@@ -381,19 +392,6 @@ textarea { min-height: 96px; resize: vertical; }
 
 .anchors { margin-top: 12px; }
 .anchors summary { cursor: pointer; font-weight: 650; }
-
-.choice-grid {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 16px;
-  align-items: start;
-}
-
-@media (min-width: 860px) {
-  .choice-grid { grid-template-columns: 1fr 1fr; }
-}
-
-.choice-card h2 { font-size: 1.35rem; }
 
 .dimension-list {
   list-style: none;

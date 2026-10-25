@@ -13,11 +13,10 @@ import requests
 from datetime import datetime
 from typing import Optional
 
-from file_processing import process_jd_file, process_resume_file
+from file_processing import extract_candidate_info, extract_job_details, process_jd_file, process_resume_file
 from question_generation import (
     analyze_response,
     generate_interview_questions,
-    generate_job_description,
     generate_next_main_question,
 )
 from rubric import DIMENSION_LABELS, aggregate, infer_role, infer_role_from_documents, rubric_for
@@ -482,6 +481,7 @@ async def upload_resume(
 
 
 QUESTION_LIMIT = 5
+DOCUMENTS_REQUIRED = "A job description and a resume are both required."
 
 
 def _evaluation(plan: dict) -> list:
@@ -590,10 +590,46 @@ async def recruiter_access():
     return {"auth_required": recruiter_auth_required()}
 
 
+def _documents_required():
+    raise HTTPException(status_code=400, detail=DOCUMENTS_REQUIRED)
+
+
+def _job_from_text(db: Session, content: str, company: Optional[str] = None) -> JobDescription:
+    details = extract_job_details(content)
+    job = JobDescription(
+        id=str(uuid.uuid4()),
+        title=details["title"],
+        company=company or details["company"],
+        content=content,
+        file_name=None,
+        file_type="text",
+    )
+    db.add(job)
+    db.flush()
+    return job
+
+
+def _resume_from_text(db: Session, content: str, *, practice: bool) -> CandidateResume:
+    info = extract_candidate_info(content)
+    resume = CandidateResume(
+        id=str(uuid.uuid4()),
+        candidate_name=MOCK_CANDIDATE_NAME if practice else info["name"],
+        email="mock@candidate.com" if practice else (info["email"] or None),
+        content=content,
+        file_name="practice_resume.txt" if practice else "resume.txt",
+        file_type="text",
+    )
+    db.add(resume)
+    db.flush()
+    return resume
+
+
 @app.post("/interview/create")
 async def create_interview_session(
-    jd_id: str = Form(...),
-    resume_id: str = Form(...),
+    jd_id: str = Form(""),
+    resume_id: str = Form(""),
+    jd_text: str = Form(""),
+    resume_text: str = Form(""),
     question_mode: str = Form("dynamic"),
     main_question_target: int = Form(5),
     role_family: str = Form(""),
@@ -602,12 +638,26 @@ async def create_interview_session(
     _: None = Depends(require_recruiter),
 ):
     try:
-        job_description = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
-        candidate_resume = db.query(CandidateResume).filter(CandidateResume.id == resume_id).first()
-        if not job_description:
-            raise HTTPException(status_code=404, detail="Job description not found")
-        if not candidate_resume:
-            raise HTTPException(status_code=404, detail="Resume not found")
+        jd_key = (jd_id or "").strip()
+        resume_key = (resume_id or "").strip()
+        jd_body = (jd_text or "").strip()
+        resume_body = (resume_text or "").strip()
+        if jd_key or resume_key:
+            if not jd_key or not resume_key:
+                _documents_required()
+            job_description = db.query(JobDescription).filter(JobDescription.id == jd_key).first()
+            candidate_resume = db.query(CandidateResume).filter(CandidateResume.id == resume_key).first()
+            if not job_description:
+                raise HTTPException(status_code=404, detail="Job description not found")
+            if not candidate_resume:
+                raise HTTPException(status_code=404, detail="Resume not found")
+        elif jd_body or resume_body:
+            if not jd_body or not resume_body:
+                _documents_required()
+            job_description = _job_from_text(db, jd_body)
+            candidate_resume = _resume_from_text(db, resume_body, practice=False)
+        else:
+            _documents_required()
 
         # Older clients may still send a mode, a count, or a role. New interviews ignore them.
         _ = (question_mode, main_question_target, role_family, questions_json)
@@ -621,8 +671,8 @@ async def create_interview_session(
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
             id=session_id,
-            jd_id=jd_id,
-            resume_id=resume_id,
+            jd_id=job_description.id,
+            resume_id=candidate_resume.id,
             status="ready",
             question_mode="dynamic",
             main_question_target=QUESTION_LIMIT,
@@ -889,44 +939,21 @@ async def create_mock_interview(
     db: Session = Depends(get_db),
 ):
     try:
-        # Mode, count, and role family are ignored. Practice is always five AI questions.
-        _ = (question_mode, main_question_target, role_family, questions_json)
-        role = (job_role or "").strip()
+        # Mode, count, role, and a role-only request are ignored. Practice needs both documents.
+        _ = (job_role, question_mode, main_question_target, role_family, questions_json)
         jd_body = (jd_text or "").strip()
         resume_body = (resume_text or "").strip()
-        if not role and not jd_body:
-            raise HTTPException(status_code=400, detail="Enter a role or a job description.")
-        title = role or "Practice role"
-        jd_content = jd_body or await generate_job_description(title)
-        jd_id = str(uuid.uuid4())
-        job_description = JobDescription(
-            id=jd_id,
-            title=title,
-            company="Mock Company",
-            content=jd_content,
-            file_name=None,
-            file_type="text" if jd_body else "generated",
-        )
-        db.add(job_description)
-        db.flush()
-        if resume_body:
-            mock_resume = CandidateResume(
-                id=str(uuid.uuid4()),
-                candidate_name=MOCK_CANDIDATE_NAME,
-                email="mock@candidate.com",
-                content=resume_body,
-                file_name="practice_resume.txt",
-                file_type="text",
-            )
-            db.add(mock_resume)
-            db.flush()
-        else:
-            mock_resume = get_or_create_mock_resume(db)
+        if not jd_body or not resume_body:
+            _documents_required()
+        job_description = _job_from_text(db, jd_body, company="Mock Company")
+        jd_content = job_description.content
+        title = job_description.title
+        mock_resume = _resume_from_text(db, resume_body, practice=True)
         plan = rubric_for(infer_role_from_documents(title, jd_content, mock_resume.content))
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
             id=session_id,
-            jd_id=jd_id,
+            jd_id=job_description.id,
             resume_id=mock_resume.id,
             status="ready",
             question_mode="dynamic",
