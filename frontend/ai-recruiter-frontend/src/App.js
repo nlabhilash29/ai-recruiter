@@ -45,7 +45,12 @@ function Shell({ variant, children }) {
 }
 
 export default function App() {
-  const skipIntro = process.env.NODE_ENV === "test" || prefersReducedMotion();
+  const path = window.location.pathname;
+  const skipIntro =
+    process.env.NODE_ENV === "test" ||
+    prefersReducedMotion() ||
+    path.startsWith("/interview") ||
+    path.startsWith("/recruiter");
   const [showIntro, setShowIntro] = useState(!skipIntro);
 
   return (

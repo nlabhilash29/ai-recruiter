@@ -42,6 +42,8 @@ _default_origins = [
     "https://ai-recruiter-one-sigma.vercel.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
 ]
 _extra_origins = [item.strip() for item in os.getenv("CORS_ORIGINS", "").split(",") if item.strip()]
 

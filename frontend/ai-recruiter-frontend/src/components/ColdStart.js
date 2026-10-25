@@ -14,15 +14,15 @@ export default function ColdStart() {
     }
 
     let cancelled = false;
-    let showedSlow = false;
+    let settled = false;
     const slowTimer = window.setTimeout(() => {
-      showedSlow = true;
-      if (!cancelled) setMessage(READY_TEXT);
+      if (!cancelled && !settled) setMessage(READY_TEXT);
     }, 700);
 
     async function ping() {
       try {
         await axios.get(`${API_URL}/health`, { timeout: 90000 });
+        settled = true;
         if (!cancelled) setMessage("");
       } catch (error) {
         if (cancelled) return;
@@ -35,7 +35,6 @@ export default function ColdStart() {
     return () => {
       cancelled = true;
       window.clearTimeout(slowTimer);
-      if (!showedSlow) setMessage("");
     };
   }, []);
 
