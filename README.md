@@ -149,7 +149,7 @@ From `backend/`:
 pip install -r requirements.txt
 ```
 
-Create `.env` from `.env.example` with `OPENAI_API_KEY`, `GROQ_API_KEY`, `ELEVENLABS_API_KEY`, and `RECRUITER_PASSCODE`. Questions and scoring use Groq `openai/gpt-oss-120b` (`GROQ_MODEL` overrides it). Transcription uses OpenAI Whisper. Speech uses ElevenLabs.
+Create `.env` from `.env.example`. The API still starts if `OPENAI_API_KEY`, `GROQ_API_KEY`, or `ELEVENLABS_API_KEY` is missing. A route that needs a missing key returns HTTP 503 and names the variable. Set `RECRUITER_PASSCODE` before using the recruiter pages. Questions and scoring use Groq `openai/gpt-oss-120b` (`GROQ_MODEL` overrides it). `GROQ_REASONING_EFFORT` defaults to `low`. Transcription uses OpenAI Whisper and sends the recording in its real format. Speech uses ElevenLabs `eleven_flash_v2_5` (`ELEVENLABS_MODEL_ID` and `ELEVENLABS_VOICE_ID` override the voice). Do not set `llama3-70b-8192` or `eleven_monolingual_v1`; those model ids were removed.
 
 ```
 uvicorn main:app --host 0.0.0.0 --port 8000

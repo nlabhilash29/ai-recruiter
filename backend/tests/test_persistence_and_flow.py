@@ -1,18 +1,21 @@
 import io
 import os
+import sys
 import unittest
 import wave
 
 # Configure before the app imports its database and AI clients.
+# test_api.py uses the same file. Do not delete it once the app is imported,
+# or the two modules end up pointing at a removed database.
 os.environ["AI_STUB"] = "1"
 os.environ["RECRUITER_PASSCODE"] = "smoke-pass"
-os.environ["DATABASE_URL"] = "sqlite:////tmp/airec-unit.db"
+db_path = "/tmp/airec-unit.db"
+os.environ["DATABASE_URL"] = f"sqlite:///{db_path}"
 os.environ["GROQ_API_KEY"] = ""
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["ELEVENLABS_API_KEY"] = ""
 
-db_path = "/tmp/airec-unit.db"
-if os.path.exists(db_path):
+if "main" not in sys.modules and os.path.exists(db_path):
     os.remove(db_path)
 
 from fastapi.testclient import TestClient
@@ -64,9 +67,13 @@ class InterviewFlowTests(unittest.TestCase):
         cls.client = TestClient(app)
 
     def test_fresh_database_has_no_sample_interviews(self):
-        from main import SessionLocal
+        from database import build_session_factory
 
-        db = SessionLocal()
+        path = "/tmp/airec-empty-check.db"
+        if os.path.exists(path):
+            os.remove(path)
+        _, factory, _ = build_session_factory(f"sqlite:///{path}")
+        db = factory()
         try:
             self.assertEqual(db.query(InterviewSession).count(), 0)
         finally:

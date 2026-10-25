@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from settings import GROQ_API_KEY, GROQ_MODEL, ai_stub_enabled
+from settings import GROQ_API_KEY, GROQ_MODEL, GROQ_REASONING_EFFORT, ai_stub_enabled
 
 load_dotenv()
 
@@ -124,9 +124,9 @@ FEEDBACK_RETRY_FORMAT = {
 
 def get_client():
     global _client
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not configured")
     if _client is None:
-        if not GROQ_API_KEY:
-            raise ValueError("GROQ_API_KEY not found. Please check your environment.")
         from groq import Groq
 
         _client = Groq(api_key=GROQ_API_KEY)
@@ -135,6 +135,8 @@ def get_client():
 
 def _message_text(message) -> str:
     content = getattr(message, "content", "") or ""
+    if not str(content).strip():
+        content = getattr(message, "reasoning", "") or ""
     if isinstance(content, list):
         parts = []
         for part in content:
@@ -179,7 +181,8 @@ def complete_chat(
         }
         if fmt:
             base["response_format"] = fmt
-        payloads.append({**base, "reasoning_effort": "low"})
+        if GROQ_REASONING_EFFORT:
+            payloads.append({**base, "reasoning_effort": GROQ_REASONING_EFFORT})
         payloads.append(base)
         legacy = {
             "model": GROQ_MODEL,
@@ -501,31 +504,41 @@ Feedback:
         return questions
 
 
-async def generate_job_description(job_role: str) -> str:
-    if ai_stub_enabled():
-        return (
-            f"{job_role} at Mock Company. "
-            "Responsibilities include collaborating with the team, shipping reliable work, and communicating clearly. "
-            "Requirements: relevant experience, problem solving, and care for the people affected by the work."
-        )
-    raw = complete_chat(
-        [
-            {
-                "role": "system",
-                "content": "You write concise, realistic job descriptions.",
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Write a concise job description for the role of {job_role}. "
-                    "Include key responsibilities, required skills, and qualifications."
-                ),
-            },
-        ],
-        max_completion_tokens=700,
-        temperature=0.5,
+def _template_job_description(job_role: str) -> str:
+    return (
+        f"{job_role} at Mock Company. "
+        "Responsibilities include collaborating with the team, shipping reliable work, and communicating clearly. "
+        "Requirements: relevant experience, problem solving, and care for the people affected by the work."
     )
-    return raw.strip() or f"Job description for {job_role}."
+
+
+async def generate_job_description(job_role: str) -> str:
+    if ai_stub_enabled() or not GROQ_API_KEY:
+        if not GROQ_API_KEY and not ai_stub_enabled():
+            logger.warning("GROQ_API_KEY is not configured. Using a template job description.")
+        return _template_job_description(job_role)
+    try:
+        raw = complete_chat(
+            [
+                {
+                    "role": "system",
+                    "content": "You write concise, realistic job descriptions.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Write a concise job description for the role of {job_role}. "
+                        "Include key responsibilities, required skills, and qualifications."
+                    ),
+                },
+            ],
+            max_completion_tokens=700,
+            temperature=0.5,
+        )
+        return raw.strip() or _template_job_description(job_role)
+    except Exception as exc:
+        logger.error("Falling back to a template job description: %s", exc)
+        return _template_job_description(job_role)
 
 
 async def generate_interview_questions(jd_content: str, resume_content: str) -> List[Dict[str, Any]]:

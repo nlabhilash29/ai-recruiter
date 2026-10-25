@@ -23,17 +23,25 @@ from models import (
 )
 from database import build_session_factory
 from auth import TOKEN_TTL_SECONDS, issue_token, recruiter_passcode, require_recruiter
-from settings import ELEVENLABS_API_KEY, OPENAI_API_KEY, ai_stub_enabled, missing_ai_keys
+from settings import (
+    ELEVENLABS_API_KEY,
+    ELEVENLABS_MODEL_ID,
+    ELEVENLABS_VOICE_ID,
+    OPENAI_API_KEY,
+    ai_stub_enabled,
+    missing_ai_keys,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# The process must boot when a provider key is absent so uploads, session
+# lookup, and health checks still run. Routes that call a provider return 503.
 _missing_keys = missing_ai_keys()
 if _missing_keys:
-    raise ValueError(
-        "Missing environment variables: "
-        + ", ".join(_missing_keys)
-        + ". Set them, or set AI_STUB=1 to run without external AI services."
+    logger.warning(
+        "Missing environment variables: %s. Endpoints that need them return HTTP 503 until they are set.",
+        ", ".join(_missing_keys),
     )
 
 app = FastAPI(title="AI Recruiter API")
@@ -60,7 +68,7 @@ app.add_middleware(
 engine, SessionLocal, NORMALIZED_DATABASE_URL = build_session_factory()
 logger.info("Database ready (%s)", NORMALIZED_DATABASE_URL.split("://", 1)[0])
 
-ALLOWED_DOCUMENT_TYPES = {".pdf", ".docx", ".doc", ".txt", ".rtf"}
+ALLOWED_DOCUMENT_TYPES = {".pdf", ".docx", ".txt"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
 MAX_AUDIO_BYTES = 5 * 1024 * 1024
 MOCK_CANDIDATE_NAME = "Mock Candidate"
@@ -120,7 +128,10 @@ def validate_file(file: UploadFile, allowed_types: set, max_size: int) -> None:
             status_code=400,
             detail=f"Invalid file type. Allowed types are: {', '.join(sorted(allowed_types))}",
         )
-    if not (file.content_type or "").startswith(("application/", "text/")):
+    # Browsers sometimes omit the type for an otherwise valid document.
+    # Only reject an explicit mismatch.
+    content_type = (file.content_type or "").lower()
+    if content_type and not content_type.startswith(("application/", "text/")):
         raise HTTPException(status_code=400, detail="Invalid content type. Must be a document file.")
     try:
         file_size = len(file.file.read())
@@ -538,9 +549,14 @@ async def update_interview_question(
         if not question:
             raise HTTPException(status_code=404, detail="Question not found")
         if "question_text" in question_update:
-            question.question_text = question_update["question_text"]
+            new_text = str(question_update.get("question_text") or "").strip()
+            if not new_text:
+                raise HTTPException(status_code=400, detail="question_text cannot be empty")
+            if not question.is_modified:
+                question.original_question = question.question_text
+            question.question_text = new_text
             question.is_modified = True
-            question.modified_at = datetime.utcnow()
+            question.updated_at = datetime.utcnow()
         db.commit()
         return {
             "id": question.id,
@@ -884,16 +900,49 @@ async def validate_interview_id(interview_id: str, db: Session = Depends(get_db)
         raise HTTPException(status_code=500, detail="The interview could not be validated.")
 
 
-def _audio_suffix(content: bytes, filename: str, content_type: str) -> str:
-    name = (filename or "").lower()
-    ctype = (content_type or "").lower()
-    if content[:4] == b"RIFF" or name.endswith(".wav") or "wav" in ctype:
-        return ".wav"
-    if name.endswith(".mp3") or "mpeg" in ctype or content[:3] == b"ID3":
-        return ".mp3"
-    if name.endswith(".m4a") or name.endswith(".mp4") or "mp4" in ctype:
-        return ".m4a"
-    return ".webm"
+def audio_extension(content: bytes, filename: Optional[str], content_type: Optional[str]) -> str:
+    """Pick a Whisper-supported extension from the recording itself.
+
+    Sending every take as audio/mpeg made Whisper reject webm and wav uploads.
+    """
+    header = content[:16]
+    content_type = (content_type or "").lower()
+    filename = filename or ""
+    if header.startswith(b"RIFF") or "wav" in content_type:
+        return "wav"
+    if header.startswith(b"\x1a\x45\xdf\xa3") or "webm" in content_type or "matroska" in content_type:
+        return "webm"
+    if header.startswith(b"OggS") or "ogg" in content_type:
+        return "ogg"
+    if (
+        header.startswith(b"ID3")
+        or header[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+        or "mpeg" in content_type
+        or "mp3" in content_type
+    ):
+        return "mp3"
+    if b"ftyp" in header or "mp4" in content_type or "m4a" in content_type:
+        if "m4a" in content_type or filename.lower().endswith(".m4a"):
+            return "m4a"
+        return "mp4"
+    if "." in filename:
+        extension = filename.rsplit(".", 1)[-1].lower()
+        if extension in {"wav", "webm", "mp3", "ogg", "m4a", "mp4", "flac", "mpeg"}:
+            return extension
+    return "webm"
+
+
+def audio_media_type(extension: str) -> str:
+    return {
+        "wav": "audio/wav",
+        "webm": "audio/webm",
+        "mp3": "audio/mpeg",
+        "mpeg": "audio/mpeg",
+        "ogg": "audio/ogg",
+        "mp4": "audio/mp4",
+        "m4a": "audio/mp4",
+        "flac": "audio/flac",
+    }.get(extension, "application/octet-stream")
 
 
 async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", content_type: str = "") -> str:
@@ -902,8 +951,10 @@ async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", 
             "I led the work to build an AI interview product. I broke the problem into transcription, "
             "scoring, and a clear candidate experience, and I checked the result against real interviews."
         )
-    suffix = _audio_suffix(content, filename, content_type)
-    temp_file_path = f"temp_{uuid.uuid4()}{suffix}"
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
+    extension = audio_extension(content, filename, content_type)
+    temp_file_path = f"temp_{uuid.uuid4()}.{extension}"
     try:
         with open(temp_file_path, "wb") as temp_file:
             temp_file.write(content)
@@ -911,7 +962,13 @@ async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", 
             response = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                files={"file": (os.path.basename(temp_file_path), audio_file, content_type or "application/octet-stream")},
+                files={
+                    "file": (
+                        os.path.basename(temp_file_path),
+                        audio_file,
+                        audio_media_type(extension),
+                    )
+                },
                 data={"model": "whisper-1", "response_format": "text", "language": "en"},
                 timeout=90,
             )
@@ -948,7 +1005,9 @@ async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", 
 def text_to_speech(text: str) -> bytes:
     if ai_stub_enabled():
         return SILENT_MP3
-    url = "https://api.elevenlabs.io/v1/text-to-speech/pNInz6obpgDQGcFmaJgB"
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY is not configured")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     headers = {
         "Accept": "audio/mpeg",
         "Content-Type": "application/json",
@@ -956,7 +1015,7 @@ def text_to_speech(text: str) -> bytes:
     }
     data = {
         "text": text,
-        "model_id": "eleven_monolingual_v1",
+        "model_id": ELEVENLABS_MODEL_ID,
         "voice_settings": {
             "stability": 0.5,
             "similarity_boost": 0.5,

@@ -1,6 +1,12 @@
-const configured = process.env.REACT_APP_API_URL;
-export const API_URL =
-  configured || (process.env.NODE_ENV === "development" ? "http://localhost:8000" : "");
+function normalizeApiUrl(value) {
+  const trimmed = String(value || "").trim().replace(/\/$/, "");
+  if (trimmed && trimmed !== "undefined") return trimmed;
+  // Development has a local API. A production build with no URL must not call
+  // the string "undefined"; ColdStart tells the operator to set the variable.
+  return process.env.NODE_ENV === "development" ? "http://localhost:8000" : "";
+}
+
+export const API_URL = normalizeApiUrl(process.env.REACT_APP_API_URL);
 
 const TOKEN_KEY = "recruiterToken";
 
@@ -40,7 +46,11 @@ function extractDetail(error) {
       return "";
     }
   }
-  if (typeof data === "string") return data;
+  if (typeof data === "string") {
+    const trimmed = data.trim();
+    if (trimmed.startsWith("<")) return "";
+    return trimmed;
+  }
   if (typeof data.detail === "string") return data.detail;
   if (typeof data.message === "string") return data.message;
   return "";

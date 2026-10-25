@@ -23,6 +23,7 @@ frontend/package-lock.json
 frontend/yarn.lock
 frontend/pnpm-lock.yaml
 frontend/build/
+frontend/ai-recruiter-frontend/build/
 frontend/dist/
 frontend/coverage/
 

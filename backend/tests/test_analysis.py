@@ -1,7 +1,14 @@
 import os
 import unittest
 
-os.environ.setdefault("AI_STUB", "1")
+# These must be set before question_generation imports settings. load_dotenv
+# does not override variables that are already present.
+os.environ["AI_STUB"] = "1"
+os.environ["GROQ_API_KEY"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["ELEVENLABS_API_KEY"] = ""
+os.environ["GROQ_MODEL"] = "openai/gpt-oss-120b"
+os.environ["ELEVENLABS_MODEL_ID"] = "eleven_flash_v2_5"
 
 from question_generation import finalize_analysis, parse_response_analysis
 

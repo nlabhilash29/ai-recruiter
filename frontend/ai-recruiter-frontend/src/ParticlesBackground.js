@@ -7,10 +7,17 @@ export default function ParticlesBackground() {
 
   useEffect(() => {
     const mount = mountRef.current;
+    if (!mount || process.env.NODE_ENV === "test") return undefined;
     const reduced = prefersReducedMotion();
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    let renderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    } catch (error) {
+      console.error("Background WebGL unavailable:", error);
+      return undefined;
+    }
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     mount.appendChild(renderer.domElement);
