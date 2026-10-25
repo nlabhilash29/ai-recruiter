@@ -412,3 +412,77 @@ textarea { min-height: 96px; resize: vertical; }
   margin: 0 0 6px;
   font-weight: 700;
 }
+
+.landing {
+  width: min(1040px, calc(100% - 32px));
+  padding-top: 36px;
+}
+
+.landing-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  margin: 28px auto 8px;
+}
+
+.landing-hero h1 {
+  max-width: 16ch;
+  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  line-height: 1.12;
+}
+
+.landing-hero .lede {
+  max-width: 40rem;
+  margin: 8px auto 22px;
+  font-size: 1.08rem;
+}
+
+.landing-note {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+.landing-how { margin-top: 56px; }
+
+.landing-how h2 { text-align: center; margin-bottom: 18px; }
+
+.landing-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 16px;
+}
+
+@media (min-width: 860px) {
+  .landing-steps { grid-template-columns: repeat(3, 1fr); align-items: stretch; }
+}
+
+.landing-steps .card { margin: 0; }
+
+.step-index {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  margin-bottom: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--blue);
+  color: var(--blue-deep);
+  font-weight: 700;
+}
+
+.step-who {
+  margin: 0 0 4px;
+  color: var(--blue-deep);
+  font-weight: 700;
+}
+
+.landing-steps h3 { font-size: 1.2rem; }
+
+.landing-steps .card > p:last-child {
+  margin: 0;
+  color: var(--muted);
+}
