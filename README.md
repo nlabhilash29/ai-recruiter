@@ -25,19 +25,19 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 **Candidate interview**
 
-- The Interview tab opens a real interview from a link or ID. Practice lives on that same tab: "Want to warm up? Practice with a sample interview before the real one."
+- The Interview tab offers two choices: paste a recruiter link, or practice. Practice is a 5-question sample and is not shared. A direct `/interview/:id` link skips that page.
 - Deep links stay at `/interview/:id`.
 - Microphone and camera check, including a short room-noise calibration. Only audio is recorded and transcribed. The camera is a framing preview and is not uploaded.
 - One **Begin interview** click unlocks audio. After that there are no Start, Stop, Re-record, or Submit buttons. The interviewer speaks, then listens. About 2.8 seconds of silence after speech ends the answer. A live microphone level, "Listening…", and "Moving on in 2…" keep the state obvious. Resumed speech cancels the countdown.
 - No speech for about 15 seconds replays the question once, then moves on without a score. Answers stop before the 5 MB upload limit. "I'm done answering" is a small text fallback.
-- AI-generated interviews show "Question X of N" for main questions and "Follow-up" for a probe. At most one follow-up per main question.
+- Every new interview is five AI-generated questions. "Question X of 5" counts those questions. Older interviews that stored a different count or a fixed list still play.
 
 **Recruiter area**
 
-- Two tabs only: Interview and Recruiter. The recruiter page creates interviews and copies a candidate link. It does not start the interview.
+- Two tabs only: Interview and Recruiter. The recruiter page creates an interview from a job description and a resume, then shows an interview link to copy. It does not start the interview.
 - Open by default. Set `RECRUITER_AUTH_REQUIRED=true` to require `RECRUITER_PASSCODE`. The passcode alone does not lock the desk.
-- Searchable interview list with a status filter.
-- Question mode at setup: **AI-generated questions** (default) or **Preset questions** (draft with AI, then edit). A role family picker weights the rubric. Main-question count defaults to 5.
+- **View candidate reports** lists interviews with search and a status filter.
+- The role used for rubric weights is inferred from the job description and resume. There is no role picker and no question-count or preset-question control.
 
 **Results**
 
@@ -171,7 +171,7 @@ This fork is the work in [nlabhilash29/ai-recruiter](https://github.com/nlabhila
 - **Deployment fixes.** The API boots without every provider key and names the missing one with HTTP 503. Recordings are sent to Whisper in their real format. Question edits no longer write a column that does not exist. Retired Groq and ElevenLabs model ids are not the defaults. A clean frontend install no longer depends on `react-mic`.
 - **Feedback reliability.** Scores and feedback survive multiline labels, markdown headings, and JSON. Empty feedback is retried, then filled with a short fallback, and improvement notes are stored and shown.
 - **Candidate and recruiter separation.** Candidates use `/interview/:id`. Recruiters use `/recruiter` to create interviews, copy a candidate link, and open results. The desk is open unless `RECRUITER_AUTH_REQUIRED=true`.
-- **Hands-free interviews.** AI-generated or preset questions, browser voice detection, and a five-dimension rubric with role weights.
+- **Hands-free interviews.** Five AI-generated questions, browser voice detection, and a five-dimension rubric. The role weight is inferred from the job description and resume.
 - **Results redesign.** Summary card, score bars, per-question evidence, and a plain explanation of how the score was built. Older technical / communication / cultural-fit rows still render.
 - **UX and accessibility.** Cold-start copy, device check, spoken questions, visible listening state, copy-link buttons, visible focus, labelled inputs, and `prefers-reduced-motion`.
 - **Postgres-ready persistence.** `DATABASE_URL` works with Render's `postgres://` URLs. The old sample database and session files are not shipped.

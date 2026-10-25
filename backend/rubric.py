@@ -188,6 +188,15 @@ def infer_role(title: str | None) -> str:
     return "general"
 
 
+def infer_role_from_documents(*parts: str | None) -> str:
+    """First specific match wins: title, then job description, then resume. Otherwise general."""
+    for part in parts:
+        family = infer_role(part)
+        if family != "general":
+            return family
+    return "general"
+
+
 def rubric_for(role: str | None) -> dict:
     raw = (role or "").strip().lower().replace("-", "_").replace(" ", "_")
     known = set(ROLE_WEIGHTS) | {

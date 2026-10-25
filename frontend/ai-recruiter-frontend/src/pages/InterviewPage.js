@@ -430,8 +430,6 @@ export default function InterviewPage() {
           <h1>{session?.is_mock ? "Practice interview" : "Interview"}</h1>
         </div>
         <div className="id-row">
-          <code>{id}</code>
-          <CopyButton text={id} label="Copy ID" />
           <CopyButton text={link} label="Copy link" />
         </div>
       </div>
@@ -473,6 +471,13 @@ export default function InterviewPage() {
           <button type="button" className="btn btn-primary" onClick={beginInterview} disabled={!calibrated}>
             Begin interview
           </button>
+          {!session?.is_mock ? (
+            <p className="fallback-row">
+              <Link className="text-link" to="/#practice">
+                Want to warm up first?
+              </Link>
+            </p>
+          ) : null}
         </section>
       )}
 

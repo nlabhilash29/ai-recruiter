@@ -16,7 +16,7 @@ async function writeClipboard(text) {
   document.body.removeChild(field);
 }
 
-export default function CopyButton({ text, label = "Copy ID" }) {
+export default function CopyButton({ text, label = "Copy link" }) {
   const [copied, setCopied] = useState(false);
 
   async function onClick() {

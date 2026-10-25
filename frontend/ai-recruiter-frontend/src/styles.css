@@ -381,3 +381,36 @@ textarea { min-height: 96px; resize: vertical; }
 
 .anchors { margin-top: 12px; }
 .anchors summary { cursor: pointer; font-weight: 650; }
+
+.choice-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+  align-items: start;
+}
+
+@media (min-width: 860px) {
+  .choice-grid { grid-template-columns: 1fr 1fr; }
+}
+
+.choice-card h2 { font-size: 1.35rem; }
+
+.dimension-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 20px;
+}
+
+.dimension-list li {
+  display: grid;
+  gap: 2px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.dimension-list span { color: var(--muted); }
+
+.interview-link-label {
+  margin: 0 0 6px;
+  font-weight: 700;
+}
