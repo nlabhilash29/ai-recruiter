@@ -1,10 +1,7 @@
-import { render, screen } from '@testing-library/react';
-import App from './App';
+import { render, screen } from "@testing-library/react";
+import App from "./App";
 
-test('renders the interview navigation', () => {
+test("renders the practice interview page", () => {
   render(<App />);
-  expect(screen.getByRole('button', { name: 'Mock Interview' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Recruiter Dashboard' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Video Interview' })).toBeInTheDocument();
-  expect(screen.getByRole('button', { name: 'Create Mock Interview' })).toBeDisabled();
+  expect(screen.getByRole("heading", { name: /practice interview/i })).toBeInTheDocument();
 });

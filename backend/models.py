@@ -137,5 +137,5 @@ class CandidateResponse(Base):
     question = relationship("InterviewQuestion", back_populates="responses")
 
 def init_db(engine):
-    """Initialize the database by creating all tables"""
+    """Create tables if they do not exist. Does not load sample interviews."""
     Base.metadata.create_all(bind=engine)

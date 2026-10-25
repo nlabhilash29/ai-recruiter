@@ -1,4 +1,11 @@
 {
+  "name": "ai-recruiter-backend",
+  "private": true,
+  "author": "Abhilash N L (https://github.com/nlabhilash29)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nlabhilash29/ai-recruiter.git"
+  },
   "dependencies": {
     "three": "^0.170.0"
   }

@@ -15,6 +15,7 @@ backend/temp/
 
 # Node (Frontend)
 frontend/ai-recruiter-frontend/node_modules/
+frontend/ai-recruiter-frontend/build/
 frontend/npm-debug.log*
 frontend/yarn-debug.log*
 frontend/.pnpm-debug.log*
