@@ -8,6 +8,7 @@ from rubric import (
     ROLE_WEIGHTS,
     aggregate,
     follow_up_reason,
+    infer_role_from_documents,
     recommend,
     rubric_for,
     weighted_overall,
@@ -26,6 +27,11 @@ class RubricTests(unittest.TestCase):
         self.assertEqual(plan["weights"]["communication"], 25)
         inferred = rubric_for("Forward Deployed Engineer, payments")
         self.assertEqual(inferred["role_family"], "forward_deployed_engineer")
+        self.assertEqual(
+            infer_role_from_documents("Opening", "We need a product manager for growth.", "Engineer who codes."),
+            "product_manager",
+        )
+        self.assertEqual(infer_role_from_documents("Hello", "No title words here."), "general")
 
     def test_unassessed_dimensions_do_not_change_the_overall(self):
         full = {"problem_solving": 8, "communication": 8, "role_knowledge": 8, "ownership": 8, "collaboration": 8}

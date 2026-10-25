@@ -31,7 +31,7 @@ export default function ReportPage() {
   return (
     <div className="page">
       <Link className="text-link" to="/recruiter">
-        All interviews
+        View candidate reports
       </Link>
       {error ? <div className="alert alert-error">{error}</div> : null}
       {!report && !error ? <p className="card">Loading the report…</p> : null}

@@ -19,9 +19,8 @@ from question_generation import (
     generate_interview_questions,
     generate_job_description,
     generate_next_main_question,
-    maybe_follow_up_question,
 )
-from rubric import DIMENSION_LABELS, aggregate, infer_role, rubric_for
+from rubric import DIMENSION_LABELS, aggregate, infer_role, infer_role_from_documents, rubric_for
 from models import (
     CandidateResponse,
     CandidateResume,
@@ -260,7 +259,7 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
     mains = [question for question in questions if not question.is_follow_up]
     main_answered = sum(1 for question in mains if question.responses)
     if mode == "dynamic":
-        total_questions = interview.main_question_target or len(mains) or 1
+        total_questions = _dynamic_target(interview)
     else:
         total_questions = len(mains) or interview.main_question_target or 1
     technical = _mean(technical_values)
@@ -363,9 +362,8 @@ def _candidate_view(interview: InterviewSession) -> dict:
     answered_ids = {response.question_id for response in (interview.responses or [])}
     current = next((question for question in questions if question.id not in answered_ids), None)
     mode = interview.question_mode or "preset"
-    target = interview.main_question_target or max(len(questions), 1)
     mains = [question for question in questions if not question.is_follow_up]
-    total_main = target if mode == "dynamic" else max(len(mains), 1)
+    total_main = _dynamic_target(interview) if mode == "dynamic" else max(len(mains), 1)
     ready = interview.status in {"ready", "in_progress"} and current is not None
     if interview.status == "completed":
         ready = False
@@ -386,7 +384,7 @@ def _candidate_view(interview: InterviewSession) -> dict:
         "is_mock": _is_mock(interview),
         "question_mode": mode,
         "total_questions": total_main,
-        "main_question_target": target,
+        "main_question_target": total_main,
         "answered_questions": len(answered_ids),
         "current_question": None
         if not current
@@ -483,12 +481,23 @@ async def upload_resume(
         await file.close()
 
 
-def _clamp_target(value) -> int:
+QUESTION_LIMIT = 5
+
+
+def _evaluation(plan: dict) -> list:
+    return [
+        {"id": item["id"], "label": item["label"], "description": item["descriptor"]}
+        for item in plan.get("dimensions") or []
+    ]
+
+
+def _dynamic_target(interview: InterviewSession) -> int:
+    """New interviews are five questions. Older rows keep a smaller stored count, never more than five."""
     try:
-        number = int(value)
+        stored = int(interview.main_question_target or QUESTION_LIMIT)
     except (TypeError, ValueError):
-        number = 5
-    return max(3, min(8, number))
+        stored = QUESTION_LIMIT
+    return max(1, min(stored, QUESTION_LIMIT))
 
 
 def _question_payload(question: InterviewQuestion) -> dict:
@@ -600,57 +609,51 @@ async def create_interview_session(
         if not candidate_resume:
             raise HTTPException(status_code=404, detail="Resume not found")
 
-        mode = "preset" if (question_mode or "").strip().lower() == "preset" else "dynamic"
-        target = _clamp_target(main_question_target)
-        family = (role_family or "").strip() or infer_role(job_description.title)
-        plan = rubric_for(family)
+        # Older clients may still send a mode, a count, or a role. New interviews ignore them.
+        _ = (question_mode, main_question_target, role_family, questions_json)
+        plan = rubric_for(
+            infer_role_from_documents(
+                job_description.title,
+                job_description.content,
+                candidate_resume.content,
+            )
+        )
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
             id=session_id,
             jd_id=jd_id,
             resume_id=resume_id,
-            status="draft" if mode == "preset" else "ready",
-            question_mode=mode,
-            main_question_target=target,
+            status="ready",
+            question_mode="dynamic",
+            main_question_target=QUESTION_LIMIT,
             role_family=plan["role_family"],
             rubric=plan,
             scheduled_datetime=datetime.utcnow(),
         )
         db.add(interview_session)
         db.flush()
-        if mode == "preset":
-            supplied = _parse_question_list(questions_json)
-            if supplied:
-                generated_questions = supplied[:target]
-            else:
-                generated_questions = await generate_interview_questions(
-                    job_description.content, candidate_resume.content
-                )
-                generated_questions = generated_questions[:target]
-            questions = _store_questions(db, session_id, generated_questions)
-            message = "Preset questions are ready to edit."
-        else:
-            first = await generate_next_main_question(
-                job_description.content,
-                candidate_resume.content,
-                [],
-                1,
-                plan["role_family"],
-                [],
-            )
-            questions = _store_questions(db, session_id, [first])
-            message = "Interview ready. Questions will be written as the conversation goes."
+        first = await generate_next_main_question(
+            job_description.content,
+            candidate_resume.content,
+            [],
+            1,
+            plan["role_family"],
+            [],
+        )
+        questions = _store_questions(db, session_id, [first])
         db.commit()
         return {
             "interview_id": session_id,
-            "status": interview_session.status,
-            "question_mode": mode,
-            "main_question_target": target,
+            "status": "ready",
+            "question_mode": "dynamic",
+            "main_question_target": QUESTION_LIMIT,
             "role_family": plan["role_family"],
+            "role_label": plan["role_label"],
+            "evaluation": _evaluation(plan),
             "candidate_name": candidate_resume.candidate_name,
             "job_title": job_description.title,
             "questions": questions,
-            "message": message,
+            "message": "Interview is ready. Questions are ready.",
         }
     except HTTPException:
         db.rollback()
@@ -876,42 +879,58 @@ def get_or_create_mock_resume(db: Session) -> CandidateResume:
 
 @app.post("/mock-interview")
 async def create_mock_interview(
-    job_role: str = Form(...),
-    question_mode: str = Form("dynamic"),
+    job_role: str = Form(""),
+    jd_text: str = Form(""),
+    resume_text: str = Form(""),
+    question_mode: str = Form(""),
     main_question_target: int = Form(5),
     role_family: str = Form(""),
     questions_json: str = Form(""),
     db: Session = Depends(get_db),
 ):
     try:
+        # Mode, count, and role family are ignored. Practice is always five AI questions.
+        _ = (question_mode, main_question_target, role_family, questions_json)
         role = (job_role or "").strip()
-        if not role:
-            raise HTTPException(status_code=400, detail="Please enter a job role.")
-        mode = "preset" if (question_mode or "").strip().lower() == "preset" else "dynamic"
-        target = _clamp_target(main_question_target)
-        jd_content = await generate_job_description(role)
+        jd_body = (jd_text or "").strip()
+        resume_body = (resume_text or "").strip()
+        if not role and not jd_body:
+            raise HTTPException(status_code=400, detail="Enter a role or a job description.")
+        title = role or "Practice role"
+        jd_content = jd_body or await generate_job_description(title)
         jd_id = str(uuid.uuid4())
         job_description = JobDescription(
             id=jd_id,
-            title=role,
+            title=title,
             company="Mock Company",
             content=jd_content,
             file_name=None,
-            file_type="generated",
+            file_type="text" if jd_body else "generated",
         )
         db.add(job_description)
         db.flush()
-        family = (role_family or "").strip() or infer_role(role)
-        plan = rubric_for(family)
-        mock_resume = get_or_create_mock_resume(db)
+        if resume_body:
+            mock_resume = CandidateResume(
+                id=str(uuid.uuid4()),
+                candidate_name=MOCK_CANDIDATE_NAME,
+                email="mock@candidate.com",
+                content=resume_body,
+                file_name="practice_resume.txt",
+                file_type="text",
+            )
+            db.add(mock_resume)
+            db.flush()
+        else:
+            mock_resume = get_or_create_mock_resume(db)
+        plan = rubric_for(infer_role_from_documents(title, jd_content, mock_resume.content))
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
             id=session_id,
             jd_id=jd_id,
             resume_id=mock_resume.id,
             status="ready",
-            question_mode=mode,
-            main_question_target=target,
+            question_mode="dynamic",
+            main_question_target=QUESTION_LIMIT,
             role_family=plan["role_family"],
             rubric=plan,
             created_at=datetime.utcnow(),
@@ -919,30 +938,27 @@ async def create_mock_interview(
         )
         db.add(interview_session)
         db.flush()
-        if mode == "preset":
-            supplied = _parse_question_list(questions_json)
-            if supplied:
-                generated_questions = supplied[:target]
-            else:
-                generated_questions = await generate_interview_questions(jd_content, resume_content="Mock Candidate")
-                generated_questions = generated_questions[:target]
-            questions = _store_questions(db, session_id, generated_questions)
-            interview_session.main_question_target = len(questions) or target
-            message = "Practice questions are ready to edit."
-        else:
-            first = await generate_next_main_question(jd_content, "Mock Candidate", [], 1, plan["role_family"], [])
-            questions = _store_questions(db, session_id, [first])
-            message = "Practice interview created."
+        first = await generate_next_main_question(
+            jd_content,
+            mock_resume.content,
+            [],
+            1,
+            plan["role_family"],
+            [],
+        )
+        questions = _store_questions(db, session_id, [first])
         db.commit()
         return {
             "interview_id": session_id,
-            "job_role": role,
+            "job_role": title,
             "status": "ready",
-            "question_mode": mode,
-            "main_question_target": interview_session.main_question_target,
+            "question_mode": "dynamic",
+            "main_question_target": QUESTION_LIMIT,
             "role_family": plan["role_family"],
+            "role_label": plan["role_label"],
+            "evaluation": _evaluation(plan),
             "questions": questions,
-            "message": message,
+            "message": "Practice interview created.",
         }
     except HTTPException:
         db.rollback()
@@ -1165,27 +1181,9 @@ async def process_video(
         job = interview_session.job_description
         resume = interview_session.candidate_resume
         spoken = None
-        if mode == "dynamic" and not current_question.is_follow_up and not analysis.get("not_assessed"):
-            follow_up = await maybe_follow_up_question(current_question.question_text, user_message, analysis)
-            if follow_up:
-                sequence = max(question.sequence_number or 0 for question in all_questions) + 1
-                _append_question(
-                    db,
-                    interview_session.id,
-                    {
-                        "question_text": follow_up,
-                        "dimension": current_question.dimension or "problem_solving",
-                        "assesses": "Follow-up",
-                        "key_points": "",
-                        "is_generated": True,
-                    },
-                    sequence=sequence,
-                    main_index=current_question.main_index or current_question.sequence_number,
-                    is_follow_up=True,
-                )
-                spoken = follow_up
-
-        if spoken is None and mode == "dynamic":
+        # New interviews are five main questions. A follow-up already stored on an older
+        # interview is still asked, and no new follow-up is added.
+        if mode == "dynamic":
             history_rows = (
                 db.query(CandidateResponse, InterviewQuestion)
                 .join(InterviewQuestion, CandidateResponse.question_id == InterviewQuestion.id)
@@ -1198,7 +1196,7 @@ async def process_video(
                 for _, question in history_rows
                 if not question.is_follow_up
             }
-            target = interview_session.main_question_target or 5
+            target = _dynamic_target(interview_session)
             if len(asked_mains) < target:
                 covered = []
                 history = []
@@ -1250,7 +1248,7 @@ async def process_video(
             .count()
         )
         if mode == "dynamic":
-            total_main = interview_session.main_question_target or 5
+            total_main = _dynamic_target(interview_session)
         else:
             total_main = sum(1 for question in all_questions if not question.is_follow_up) or 1
         db.commit()
@@ -1306,7 +1304,8 @@ async def validate_interview_id(interview_id: str, db: Session = Depends(get_db)
             .filter(InterviewQuestion.interview_session_id == interview.id)
             .all()
         )
-        if not questions or len(questions) != 5:
+        mains = [question for question in questions if not question.is_follow_up]
+        if not mains:
             return JSONResponse(
                 status_code=400,
                 content={"valid": False, "message": "Interview is not properly set up (missing questions)"},
