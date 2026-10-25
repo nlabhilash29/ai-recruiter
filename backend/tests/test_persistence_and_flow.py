@@ -79,9 +79,17 @@ class InterviewFlowTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_recruiter_is_closed_without_configuration_and_without_a_token(self):
+    def test_recruiter_is_open_unless_auth_is_explicitly_required(self):
         previous = os.environ.pop("RECRUITER_PASSCODE")
+        previous_flag = os.environ.pop("RECRUITER_AUTH_REQUIRED", None)
         try:
+            open_list = self.client.get("/interview/search")
+            self.assertEqual(open_list.status_code, 200)
+            access = self.client.get("/recruiter/access")
+            self.assertEqual(access.status_code, 200)
+            self.assertFalse(access.json()["auth_required"])
+            os.environ["RECRUITER_AUTH_REQUIRED"] = "true"
+            self.assertTrue(self.client.get("/recruiter/access").json()["auth_required"])
             response = self.client.post("/recruiter/login", json={"passcode": "anything"})
             self.assertEqual(response.status_code, 503)
             self.assertIn("RECRUITER_PASSCODE", response.json()["detail"])
@@ -89,6 +97,10 @@ class InterviewFlowTests(unittest.TestCase):
             self.assertEqual(blocked.status_code, 503)
         finally:
             os.environ["RECRUITER_PASSCODE"] = previous
+            if previous_flag is None:
+                os.environ.pop("RECRUITER_AUTH_REQUIRED", None)
+            else:
+                os.environ["RECRUITER_AUTH_REQUIRED"] = previous_flag
 
     def test_mock_interview_answer_and_report(self):
         created = self.client.post("/mock-interview", data={"job_role": "Backend Engineer"})
@@ -108,10 +120,16 @@ class InterviewFlowTests(unittest.TestCase):
         self.assertGreater(len(spoken.content), 100)
 
         anonymous = self.client.get("/interview/search")
-        self.assertEqual(anonymous.status_code, 401)
+        self.assertEqual(anonymous.status_code, 200)
 
-        login = self.client.post("/recruiter/login", json={"passcode": "nope"})
-        self.assertEqual(login.status_code, 401)
+        os.environ["RECRUITER_AUTH_REQUIRED"] = "true"
+        try:
+            locked = self.client.get("/interview/search")
+            self.assertEqual(locked.status_code, 401)
+            login = self.client.post("/recruiter/login", json={"passcode": "nope"})
+            self.assertEqual(login.status_code, 401)
+        finally:
+            os.environ.pop("RECRUITER_AUTH_REQUIRED", None)
         login = self.client.post("/recruiter/login", json={"passcode": "smoke-pass"})
         self.assertEqual(login.status_code, 200, login.text)
         token = login.json()["token"]
@@ -148,7 +166,13 @@ class InterviewFlowTests(unittest.TestCase):
             self.assertTrue(response["improvement_suggestions"].strip())
 
         hidden = self.client.get(f"/interview/{interview_id}/details")
-        self.assertEqual(hidden.status_code, 401)
+        self.assertEqual(hidden.status_code, 200, hidden.text)
+        os.environ["RECRUITER_AUTH_REQUIRED"] = "true"
+        try:
+            locked = self.client.get(f"/interview/{interview_id}/details")
+            self.assertEqual(locked.status_code, 401)
+        finally:
+            os.environ.pop("RECRUITER_AUTH_REQUIRED", None)
         visible = self.client.get(f"/interview/{interview_id}/details", headers=headers)
         self.assertEqual(visible.status_code, 200, visible.text)
 
@@ -184,8 +208,12 @@ class InterviewFlowTests(unittest.TestCase):
         confirmed = self.client.post(f"/interview/{interview_id}/confirm", headers=headers)
         self.assertEqual(confirmed.status_code, 200, confirmed.text)
 
-        blocked = self.client.get(f"/interview/{interview_id}/results")
-        self.assertEqual(blocked.status_code, 401)
+        os.environ["RECRUITER_AUTH_REQUIRED"] = "true"
+        try:
+            blocked = self.client.get(f"/interview/{interview_id}/results")
+            self.assertEqual(blocked.status_code, 401)
+        finally:
+            os.environ.pop("RECRUITER_AUTH_REQUIRED", None)
         opened = self.client.get(f"/interview/{interview_id}/session")
         self.assertEqual(opened.status_code, 200, opened.text)
         self.assertFalse(opened.json()["is_mock"])

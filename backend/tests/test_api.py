@@ -152,12 +152,36 @@ class RecruiterDocumentFlowTests(unittest.TestCase):
         created = client.post(
             "/interview/create",
             headers=headers,
-            data={"jd_id": jd.json()["jd_id"], "resume_id": resume.json()["resume_id"]},
+            data={
+                "jd_id": jd.json()["jd_id"],
+                "resume_id": resume.json()["resume_id"],
+                "question_mode": "preset",
+                "role_family": "software_developer",
+            },
         )
         self.assertEqual(created.status_code, 200, created.text)
         interview_id = created.json()["interview_id"]
+        self.assertEqual(created.json()["question_mode"], "preset")
         self.assertEqual(len(created.json()["questions"]), 5)
         self.assertEqual(created.json()["status"], "draft")
+
+        dynamic = client.post(
+            "/interview/create",
+            headers=headers,
+            data={
+                "jd_id": jd.json()["jd_id"],
+                "resume_id": resume.json()["resume_id"],
+                "question_mode": "dynamic",
+                "main_question_target": "4",
+                "role_family": "sales",
+            },
+        )
+        self.assertEqual(dynamic.status_code, 200, dynamic.text)
+        self.assertEqual(dynamic.json()["status"], "ready")
+        self.assertEqual(dynamic.json()["question_mode"], "dynamic")
+        self.assertEqual(dynamic.json()["role_family"], "sales")
+        self.assertEqual(dynamic.json()["main_question_target"], 4)
+        self.assertEqual(len(dynamic.json()["questions"]), 1)
 
         not_ready = client.get(f"/interview/validate/{interview_id}")
         self.assertEqual(not_ready.status_code, 400)
@@ -197,7 +221,9 @@ class InterviewLoopTests(unittest.TestCase):
         created = client.post("/mock-interview", data={"job_role": "Frontend Engineer"})
         self.assertEqual(created.status_code, 200, created.text)
         interview_id = created.json()["interview_id"]
-        self.assertEqual(len(created.json()["questions"]), 5)
+        self.assertEqual(created.json()["question_mode"], "dynamic")
+        self.assertEqual(created.json()["main_question_target"], 5)
+        self.assertEqual(len(created.json()["questions"]), 1)
 
         for expected_answer_count in range(1, 6):
             answer = client.post(
@@ -226,6 +252,51 @@ class InterviewLoopTests(unittest.TestCase):
 
         blocked = client.get(f"/interview/validate/{interview_id}")
         self.assertEqual(blocked.status_code, 400)
+        self.assertFalse(body["scoring"]["legacy"])
+        self.assertGreater(body["scoring"]["dimension_scores"]["communication"], 0)
+        self.assertIn("advance", body["interview_summary"]["overall_recommendation"].lower())
+
+    def test_no_speech_moves_on_without_a_score(self):
+        created = client.post(
+            "/mock-interview",
+            data={"job_role": "Product Manager", "main_question_target": "3", "role_family": "product_manager"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        interview_id = created.json()["interview_id"]
+        answer = client.post(
+            "/talk-video",
+            data={"interview_id": interview_id, "no_speech": "true"},
+            files={"file": ("empty.wav", b"", "audio/wav")},
+        )
+        self.assertEqual(answer.status_code, 200, answer.text)
+        self.assertEqual(answer.headers["x-interview-status"], "in_progress")
+        self.assertEqual(answer.headers["x-answered-questions"], "1")
+        session = client.get(f"/interview/{interview_id}/session")
+        self.assertEqual(session.json()["current_question"]["main_index"], 2)
+        self.assertEqual(session.json()["current_question"]["progress_label"], "Question 2 of 3")
+        report = client.get(f"/interview/{interview_id}/results")
+        response = report.json()["questions"][0]["responses"][0]
+        self.assertIn("not scored", response["ai_feedback"].lower())
+        self.assertTrue(response["improvement_suggestions"].strip())
+        self.assertIsNone(response["score"])
+
+    def test_preset_practice_keeps_the_edited_list(self):
+        created = client.post(
+            "/mock-interview",
+            data={"job_role": "Account Executive", "question_mode": "preset", "main_question_target": "5"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        interview_id = created.json()["interview_id"]
+        self.assertEqual(created.json()["question_mode"], "preset")
+        self.assertEqual(created.json()["status"], "ready")
+        self.assertEqual(len(created.json()["questions"]), 5)
+        added = client.post(
+            f"/interview/{interview_id}/questions",
+            data={"question_text": "Tell me about a deal you owned from first meeting to close."},
+        )
+        self.assertEqual(added.status_code, 200, added.text)
+        session = client.get(f"/interview/{interview_id}/session")
+        self.assertEqual(session.json()["total_questions"], 6)
 
     def test_video_requires_openai_key_when_stub_is_off(self):
         previous = os.environ.get("AI_STUB")

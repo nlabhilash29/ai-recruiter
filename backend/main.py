@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
+import json
 import logging
 import os
 import uuid
@@ -13,7 +14,14 @@ from datetime import datetime
 from typing import Optional
 
 from file_processing import process_jd_file, process_resume_file
-from question_generation import analyze_response, generate_interview_questions, generate_job_description
+from question_generation import (
+    analyze_response,
+    generate_interview_questions,
+    generate_job_description,
+    generate_next_main_question,
+    maybe_follow_up_question,
+)
+from rubric import DIMENSION_LABELS, aggregate, infer_role, rubric_for
 from models import (
     CandidateResponse,
     CandidateResume,
@@ -22,7 +30,7 @@ from models import (
     JobDescription,
 )
 from database import build_session_factory
-from auth import TOKEN_TTL_SECONDS, issue_token, recruiter_passcode, require_recruiter
+from auth import TOKEN_TTL_SECONDS, issue_token, recruiter_auth_required, recruiter_passcode, require_recruiter
 from settings import (
     ELEVENLABS_API_KEY,
     ELEVENLABS_MODEL_ID,
@@ -188,6 +196,8 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
     answered_questions = 0
     strengths = []
     improvements = []
+    per_answer_scores = []
+    legacy_answers = False
     technical_values = []
     clarity_values = []
     cultural_values = []
@@ -211,14 +221,22 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
                 strengths.append(response.ai_feedback.strip())
             if response.score is not None and response.score < 6 and (response.improvement_suggestions or "").strip():
                 improvements.append(response.improvement_suggestions.strip())
+            if response.dimension_scores:
+                per_answer_scores.append(response.dimension_scores)
+            elif response.technical_accuracy is not None or response.clarity_score is not None:
+                legacy_answers = True
             if response.technical_accuracy is not None:
                 technical_values.append(response.technical_accuracy)
             if response.clarity_score is not None:
                 clarity_values.append(response.clarity_score)
             if (question.question_type or "").lower() == "cultural-fit" and response.score is not None:
                 cultural_values.append(response.score)
+            responses[-1]["evidence"] = response.evidence or ""
+            responses[-1]["dimension_scores"] = response.dimension_scores or {}
         if responses:
             answered_questions += 1
+        main_index = question.main_index or question.sequence_number
+        progress_label = "Follow-up" if question.is_follow_up else f"Question {main_index}"
         questions_with_responses.append(
             {
                 "id": question.id,
@@ -226,6 +244,10 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
                 "question_type": question.question_type,
                 "category": question.category,
                 "sequence_number": question.sequence_number,
+                "main_index": main_index,
+                "is_follow_up": bool(question.is_follow_up),
+                "dimension": question.dimension,
+                "progress_label": progress_label,
                 "is_modified": question.is_modified,
                 "original_question": question.original_question if question.is_modified else None,
                 "expected_answer_keywords": question.expected_answer_keywords,
@@ -234,14 +256,38 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
             }
         )
 
-    total_questions = len(questions)
+    mode = interview.question_mode or "preset"
+    mains = [question for question in questions if not question.is_follow_up]
+    main_answered = sum(1 for question in mains if question.responses)
+    if mode == "dynamic":
+        total_questions = interview.main_question_target or len(mains) or 1
+    else:
+        total_questions = len(mains) or interview.main_question_target or 1
     technical = _mean(technical_values)
     communication = _mean(clarity_values)
-    if technical is not None and communication is not None:
-        overall = (technical + communication) / 2
-    else:
-        overall = technical if technical is not None else communication
     cultural = _mean(cultural_values)
+    role = interview.role_family or infer_role(interview.job_description.title if interview.job_description else "")
+    plan = interview.rubric or rubric_for(role)
+    if per_answer_scores:
+        rolled = aggregate(per_answer_scores, role)
+        overall = rolled["overall"] if rolled["overall"] is not None else interview.overall_score
+        recommendation = rolled["recommendation"]
+        dimension_scores = rolled["dimensions"]
+        legacy = False
+        if technical is None:
+            technical = dimension_scores.get("role_knowledge")
+        if communication is None:
+            communication = dimension_scores.get("communication")
+        if cultural is None:
+            cultural = dimension_scores.get("collaboration")
+    else:
+        if technical is not None and communication is not None:
+            overall = (technical + communication) / 2
+        else:
+            overall = technical if technical is not None else communication
+        recommendation = _recommendation(overall)
+        dimension_scores = {}
+        legacy = True
 
     job = interview.job_description
     resume = interview.candidate_resume
@@ -249,10 +295,12 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
         "interview_id": interview.id,
         "status": interview.status,
         "is_mock": _is_mock(interview),
+        "question_mode": mode,
+        "role_family": plan.get("role_family") if isinstance(plan, dict) else role,
         "progress": {
             "total_questions": total_questions,
-            "answered_questions": answered_questions,
-            "completion_percentage": (answered_questions / total_questions * 100) if total_questions else 0,
+            "answered_questions": main_answered,
+            "completion_percentage": (main_answered / total_questions * 100) if total_questions else 0,
         },
         "timing": {
             "created_at": interview.created_at.isoformat() if interview.created_at else None,
@@ -280,18 +328,26 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
             "technical_score": technical,
             "communication_score": communication,
             "cultural_fit_score": cultural,
+            "dimension_scores": dimension_scores,
+            "rubric": plan,
+            "legacy": legacy,
             "score_scale": 10,
             "score_note": (
-                "Each answer's score is how relevant that answer was, from 0 to 10. "
-                "The overall score is the average of technical accuracy and communication (clarity) "
-                "across every answer, also from 0 to 10. A single question can sit above or below the overall score."
+                "Each dimension is scored from 1 to 10 only when the answer contains evidence for it. "
+                "Dimensions with no evidence are left blank. The overall score weights the assessed "
+                "dimensions for this role. A single answer can sit above or below that overall score."
+                if not legacy
+                else (
+                    "This interview used the earlier scorecard. The question score is relevance. "
+                    "The overall score averages technical accuracy and communication, both out of 10."
+                )
             ),
         },
         "questions": questions_with_responses,
         "interview_summary": {
             "strengths": strengths,
             "areas_for_improvement": improvements,
-            "overall_recommendation": _recommendation(overall if interview.status == "completed" else overall),
+            "overall_recommendation": recommendation,
         },
     }
     if include_documents:
@@ -304,27 +360,45 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
 
 def _candidate_view(interview: InterviewSession) -> dict:
     questions = _ordered_questions(interview)
-    answered = len(interview.responses or [])
-    current = next((question for question in questions if question.sequence_number == answered + 1), None)
+    answered_ids = {response.question_id for response in (interview.responses or [])}
+    current = next((question for question in questions if question.id not in answered_ids), None)
+    mode = interview.question_mode or "preset"
+    target = interview.main_question_target or max(len(questions), 1)
+    mains = [question for question in questions if not question.is_follow_up]
+    total_main = target if mode == "dynamic" else max(len(mains), 1)
     ready = interview.status in {"ready", "in_progress"} and current is not None
     if interview.status == "completed":
         ready = False
         current = None
+    progress_label = None
+    main_index = None
+    if current:
+        main_index = current.main_index or current.sequence_number
+        if current.is_follow_up:
+            progress_label = "Follow-up"
+        else:
+            progress_label = f"Question {main_index} of {total_main}"
     return {
         "interview_id": interview.id,
         "status": interview.status,
         "job_title": interview.job_description.title if interview.job_description else None,
         "company": interview.job_description.company if interview.job_description else None,
         "is_mock": _is_mock(interview),
-        "total_questions": len(questions),
-        "answered_questions": min(answered, len(questions)),
+        "question_mode": mode,
+        "total_questions": total_main,
+        "main_question_target": target,
+        "answered_questions": len(answered_ids),
         "current_question": None
         if not current
         else {
             "id": current.id,
             "sequence_number": current.sequence_number,
+            "main_index": main_index,
+            "is_follow_up": bool(current.is_follow_up),
+            "progress_label": progress_label,
             "question_text": current.question_text,
             "question_type": current.question_type,
+            "dimension": current.dimension,
         },
         "ready": ready,
     }
@@ -409,37 +483,112 @@ async def upload_resume(
         await file.close()
 
 
+def _clamp_target(value) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 5
+    return max(3, min(8, number))
+
+
+def _question_payload(question: InterviewQuestion) -> dict:
+    return {
+        "id": question.id,
+        "question_text": question.question_text,
+        "question_type": question.question_type,
+        "category": question.category,
+        "sequence_number": question.sequence_number,
+        "main_index": question.main_index,
+        "is_follow_up": bool(question.is_follow_up),
+        "dimension": question.dimension,
+    }
+
+
+def _append_question(db: Session, session_id: str, question_data: dict, sequence: int, main_index: int, is_follow_up: bool = False):
+    dimension = question_data.get("dimension") or question_data.get("question_type") or "problem_solving"
+    question = InterviewQuestion(
+        id=str(uuid.uuid4()),
+        interview_session_id=session_id,
+        question_text=question_data["question_text"],
+        question_type=dimension if not is_follow_up else "follow_up",
+        category=question_data.get("assesses") or DIMENSION_LABELS.get(dimension, dimension),
+        sequence_number=sequence,
+        main_index=main_index,
+        is_follow_up=is_follow_up,
+        dimension=dimension,
+        is_generated=bool(question_data.get("is_generated", True)),
+        expected_answer_keywords=question_data.get("key_points", ""),
+        scoring_rubric={"key_points": question_data.get("key_points", [])},
+    )
+    db.add(question)
+    db.flush()
+    return question
+
+
 def _store_questions(db: Session, session_id: str, generated_questions):
     stored = []
     for idx, question_data in enumerate(generated_questions, 1):
-        question = InterviewQuestion(
-            id=str(uuid.uuid4()),
-            interview_session_id=session_id,
-            question_text=question_data["question_text"],
-            question_type=question_data.get("question_type", "general"),
-            category=question_data.get("assesses", "general"),
-            sequence_number=idx,
-            is_generated=True,
-            expected_answer_keywords=question_data.get("key_points", ""),
-            scoring_rubric={"key_points": question_data.get("key_points", [])},
+        question = _append_question(
+            db,
+            session_id,
+            question_data,
+            sequence=idx,
+            main_index=question_data.get("main_index") or idx,
+            is_follow_up=bool(question_data.get("is_follow_up")),
         )
-        db.add(question)
-        stored.append(
+        stored.append(_question_payload(question))
+    return stored
+
+
+def _parse_question_list(raw: str):
+    if not (raw or "").strip():
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="The question list could not be read.") from exc
+    if isinstance(data, dict):
+        data = data.get("questions") or []
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="The question list could not be read.")
+    questions = []
+    for item in data:
+        if isinstance(item, str):
+            text = item.strip()
+            dimension = ""
+        elif isinstance(item, dict):
+            text = str(item.get("question_text") or item.get("text") or "").strip()
+            dimension = str(item.get("dimension") or "").strip()
+        else:
+            continue
+        if len(text) < 8:
+            continue
+        questions.append(
             {
-                "id": question.id,
-                "question_text": question.question_text,
-                "question_type": question.question_type,
-                "category": question.category,
-                "sequence_number": idx,
+                "question_text": text,
+                "question_type": dimension or "problem_solving",
+                "dimension": dimension or "problem_solving",
+                "assesses": DIMENSION_LABELS.get(dimension, "Interview question"),
+                "key_points": "",
+                "is_generated": False,
             }
         )
-    return stored
+    return questions
+
+
+@app.get("/recruiter/access")
+async def recruiter_access():
+    return {"auth_required": recruiter_auth_required()}
 
 
 @app.post("/interview/create")
 async def create_interview_session(
     jd_id: str = Form(...),
     resume_id: str = Form(...),
+    question_mode: str = Form("dynamic"),
+    main_question_target: int = Form(5),
+    role_family: str = Form(""),
+    questions_json: str = Form(""),
     db: Session = Depends(get_db),
     _: None = Depends(require_recruiter),
 ):
@@ -451,26 +600,57 @@ async def create_interview_session(
         if not candidate_resume:
             raise HTTPException(status_code=404, detail="Resume not found")
 
+        mode = "preset" if (question_mode or "").strip().lower() == "preset" else "dynamic"
+        target = _clamp_target(main_question_target)
+        family = (role_family or "").strip() or infer_role(job_description.title)
+        plan = rubric_for(family)
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
             id=session_id,
             jd_id=jd_id,
             resume_id=resume_id,
-            status="draft",
+            status="draft" if mode == "preset" else "ready",
+            question_mode=mode,
+            main_question_target=target,
+            role_family=plan["role_family"],
+            rubric=plan,
             scheduled_datetime=datetime.utcnow(),
         )
         db.add(interview_session)
         db.flush()
-        generated_questions = await generate_interview_questions(job_description.content, candidate_resume.content)
-        questions = _store_questions(db, session_id, generated_questions)
+        if mode == "preset":
+            supplied = _parse_question_list(questions_json)
+            if supplied:
+                generated_questions = supplied[:target]
+            else:
+                generated_questions = await generate_interview_questions(
+                    job_description.content, candidate_resume.content
+                )
+                generated_questions = generated_questions[:target]
+            questions = _store_questions(db, session_id, generated_questions)
+            message = "Preset questions are ready to edit."
+        else:
+            first = await generate_next_main_question(
+                job_description.content,
+                candidate_resume.content,
+                [],
+                1,
+                plan["role_family"],
+                [],
+            )
+            questions = _store_questions(db, session_id, [first])
+            message = "Interview ready. Questions will be written as the conversation goes."
         db.commit()
         return {
             "interview_id": session_id,
-            "status": "draft",
+            "status": interview_session.status,
+            "question_mode": mode,
+            "main_question_target": target,
+            "role_family": plan["role_family"],
             "candidate_name": candidate_resume.candidate_name,
             "job_title": job_description.title,
             "questions": questions,
-            "message": "Interview session created with generated questions",
+            "message": message,
         }
     except HTTPException:
         db.rollback()
@@ -537,17 +717,30 @@ async def speak_current_question(interview_id: str, db: Session = Depends(get_db
     return StreamingResponse(iter([audio_output]), media_type="audio/mpeg")
 
 
+def _can_edit_questions(interview: InterviewSession) -> bool:
+    if interview.status == "completed":
+        return False
+    if interview.responses:
+        return False
+    return interview.status in {"draft", "ready"}
+
+
 @app.put("/interview/questions/{question_id}")
 async def update_interview_question(
     question_id: str,
     question_update: dict,
     db: Session = Depends(get_db),
-    _: None = Depends(require_recruiter),
+    authorization: Optional[str] = Header(default=None),
 ):
     try:
         question = db.query(InterviewQuestion).filter(InterviewQuestion.id == question_id).first()
         if not question:
             raise HTTPException(status_code=404, detail="Question not found")
+        interview = _get_interview_or_404(db, question.interview_session_id)
+        if not _is_mock(interview):
+            require_recruiter(authorization)
+        if not _can_edit_questions(interview):
+            raise HTTPException(status_code=400, detail="These questions can no longer be edited.")
         if "question_text" in question_update:
             new_text = str(question_update.get("question_text") or "").strip()
             if not new_text:
@@ -586,11 +779,14 @@ async def confirm_interview_questions(
             .filter(InterviewQuestion.interview_session_id == interview.id)
             .all()
         )
-        if len(questions) != 5:
+        mains = [question for question in questions if not question.is_follow_up]
+        if (interview.question_mode or "preset") == "preset" and not 1 <= len(mains) <= 8:
             raise HTTPException(
                 status_code=400,
-                detail=f"Interview must have exactly 5 questions. Current count: {len(questions)}",
+                detail=f"A preset interview needs 1 to 8 questions. Current count: {len(mains)}",
             )
+        if (interview.question_mode or "preset") == "preset":
+            interview.main_question_target = len(mains)
         interview.status = "ready"
         interview.updated_at = datetime.utcnow()
         db.commit()
@@ -598,7 +794,7 @@ async def confirm_interview_questions(
             "interview_id": interview.id,
             "status": "ready",
             "message": "Interview questions confirmed and ready for use",
-            "total_questions": len(questions),
+            "total_questions": len(mains) or interview.main_question_target,
         }
     except HTTPException:
         raise
@@ -651,6 +847,10 @@ async def search_interviews(
             "created_at": interview.created_at.isoformat() if interview.created_at else None,
             "overall_score": interview.overall_score,
             "is_mock": _is_mock(interview),
+            "question_mode": interview.question_mode or "preset",
+            "main_question_target": interview.main_question_target,
+            "role_family": interview.role_family,
+            "recommendation": interview.recommendation,
             "question_count": len(interview.questions or []),
             "answered_count": len(interview.responses or []),
         }
@@ -675,11 +875,20 @@ def get_or_create_mock_resume(db: Session) -> CandidateResume:
 
 
 @app.post("/mock-interview")
-async def create_mock_interview(job_role: str = Form(...), db: Session = Depends(get_db)):
+async def create_mock_interview(
+    job_role: str = Form(...),
+    question_mode: str = Form("dynamic"),
+    main_question_target: int = Form(5),
+    role_family: str = Form(""),
+    questions_json: str = Form(""),
+    db: Session = Depends(get_db),
+):
     try:
         role = (job_role or "").strip()
         if not role:
             raise HTTPException(status_code=400, detail="Please enter a job role.")
+        mode = "preset" if (question_mode or "").strip().lower() == "preset" else "dynamic"
+        target = _clamp_target(main_question_target)
         jd_content = await generate_job_description(role)
         jd_id = str(uuid.uuid4())
         job_description = JobDescription(
@@ -692,7 +901,8 @@ async def create_mock_interview(job_role: str = Form(...), db: Session = Depends
         )
         db.add(job_description)
         db.flush()
-        generated_questions = await generate_interview_questions(jd_content, resume_content="Mock Candidate")
+        family = (role_family or "").strip() or infer_role(role)
+        plan = rubric_for(family)
         mock_resume = get_or_create_mock_resume(db)
         session_id = str(uuid.uuid4())
         interview_session = InterviewSession(
@@ -700,18 +910,39 @@ async def create_mock_interview(job_role: str = Form(...), db: Session = Depends
             jd_id=jd_id,
             resume_id=mock_resume.id,
             status="ready",
+            question_mode=mode,
+            main_question_target=target,
+            role_family=plan["role_family"],
+            rubric=plan,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
         db.add(interview_session)
         db.flush()
-        _store_questions(db, session_id, generated_questions)
+        if mode == "preset":
+            supplied = _parse_question_list(questions_json)
+            if supplied:
+                generated_questions = supplied[:target]
+            else:
+                generated_questions = await generate_interview_questions(jd_content, resume_content="Mock Candidate")
+                generated_questions = generated_questions[:target]
+            questions = _store_questions(db, session_id, generated_questions)
+            interview_session.main_question_target = len(questions) or target
+            message = "Practice questions are ready to edit."
+        else:
+            first = await generate_next_main_question(jd_content, "Mock Candidate", [], 1, plan["role_family"], [])
+            questions = _store_questions(db, session_id, [first])
+            message = "Practice interview created."
         db.commit()
         return {
             "interview_id": session_id,
             "job_role": role,
-            "questions": generated_questions,
-            "message": "Practice interview created.",
+            "status": "ready",
+            "question_mode": mode,
+            "main_question_target": interview_session.main_question_target,
+            "role_family": plan["role_family"],
+            "questions": questions,
+            "message": message,
         }
     except HTTPException:
         db.rollback()
@@ -730,8 +961,22 @@ def _finish_scores(db: Session, interview_session: InterviewSession) -> None:
     )
     if not responses:
         return
-    interview_session.technical_score = sum(r.technical_accuracy or 0 for r in responses) / len(responses)
-    interview_session.communication_score = sum(r.clarity_score or 0 for r in responses) / len(responses)
+    per_answer = [response.dimension_scores for response in responses if response.dimension_scores]
+    role = interview_session.role_family or "general"
+    if per_answer:
+        rolled = aggregate(per_answer, role)
+        dims = rolled["dimensions"]
+        interview_session.dimension_scores = dims
+        interview_session.recommendation = rolled["recommendation"]
+        interview_session.overall_score = rolled["overall"] if rolled["overall"] is not None else 0
+        interview_session.technical_score = dims.get("role_knowledge") or 0
+        interview_session.communication_score = dims.get("communication") or 0
+        interview_session.cultural_fit_score = dims.get("collaboration") or 0
+        return
+    scored = [response for response in responses if response.technical_accuracy is not None or response.clarity_score is not None]
+    pool = scored or responses
+    interview_session.technical_score = sum(response.technical_accuracy or 0 for response in pool) / len(pool)
+    interview_session.communication_score = sum(response.clarity_score or 0 for response in pool) / len(pool)
     interview_session.overall_score = (
         interview_session.technical_score + interview_session.communication_score
     ) / 2
@@ -744,23 +989,130 @@ def _finish_scores(db: Session, interview_session: InterviewSession) -> None:
         interview_session.cultural_fit_score = sum(cultural) / len(cultural)
 
 
+def _form_flag(value: str) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _renumber_questions(db: Session, interview: InterviewSession) -> None:
+    questions = (
+        db.query(InterviewQuestion)
+        .filter(InterviewQuestion.interview_session_id == interview.id)
+        .order_by(InterviewQuestion.sequence_number)
+        .all()
+    )
+    main_index = 0
+    for sequence, question in enumerate(questions, 1):
+        question.sequence_number = sequence
+        if question.is_follow_up:
+            question.main_index = main_index or 1
+        else:
+            main_index += 1
+            question.main_index = main_index
+    if (interview.question_mode or "preset") == "preset" and main_index:
+        interview.main_question_target = main_index
+
+
+@app.post("/interview/{interview_id}/questions")
+async def add_interview_question(
+    interview_id: str,
+    question_text: str = Form(...),
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(default=None),
+):
+    interview = _get_interview_or_404(db, interview_id)
+    if not _is_mock(interview):
+        require_recruiter(authorization)
+    if (interview.question_mode or "preset") != "preset":
+        raise HTTPException(status_code=400, detail="Questions are written during the interview in AI-generated mode.")
+    if not _can_edit_questions(interview):
+        raise HTTPException(status_code=400, detail="These questions can no longer be edited.")
+    text = (question_text or "").strip()
+    if len(text) < 8:
+        raise HTTPException(status_code=400, detail="Write a full question before adding it.")
+    mains = [question for question in interview.questions if not question.is_follow_up]
+    if len(mains) >= 8:
+        raise HTTPException(status_code=400, detail="A preset interview can have at most 8 questions.")
+    sequence = max((question.sequence_number or 0) for question in interview.questions) + 1 if interview.questions else 1
+    question = _append_question(
+        db,
+        interview.id,
+        {
+            "question_text": text,
+            "dimension": "problem_solving",
+            "question_type": "problem_solving",
+            "assesses": "Interview question",
+            "key_points": "",
+            "is_generated": False,
+        },
+        sequence=sequence,
+        main_index=len(mains) + 1,
+    )
+    db.flush()
+    _renumber_questions(db, interview)
+    db.commit()
+    db.refresh(question)
+    return _question_payload(question)
+
+
+@app.delete("/interview/questions/{question_id}")
+async def delete_interview_question(
+    question_id: str,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(default=None),
+):
+    question = db.query(InterviewQuestion).filter(InterviewQuestion.id == question_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+    interview = _get_interview_or_404(db, question.interview_session_id)
+    if not _is_mock(interview):
+        require_recruiter(authorization)
+    if not _can_edit_questions(interview):
+        raise HTTPException(status_code=400, detail="These questions can no longer be edited.")
+    mains = [item for item in interview.questions if not item.is_follow_up]
+    if not question.is_follow_up and len(mains) <= 1:
+        raise HTTPException(status_code=400, detail="Keep at least one question.")
+    db.delete(question)
+    db.flush()
+    _renumber_questions(db, interview)
+    db.commit()
+    return {"deleted": question_id, "total_questions": interview.main_question_target}
+
+
+def _store_answer(response: CandidateResponse, analysis: dict) -> None:
+    response.score = analysis.get("relevance_score")
+    response.technical_accuracy = analysis.get("technical_score")
+    response.clarity_score = analysis.get("clarity_score")
+    response.ai_feedback = analysis.get("feedback") or ""
+    response.improvement_suggestions = analysis.get("improvement_areas") or ""
+    response.evidence = analysis.get("evidence") or ""
+    response.dimension_scores = analysis.get("dimension_scores") or {}
+
+
 @app.post("/talk-video")
 async def process_video(
-    file: UploadFile = File(...),
     interview_id: str = Form(...),
+    no_speech: str = Form("false"),
+    file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
-    """Transcribe the candidate's audio and score it. Video is not accepted or stored."""
+    """Transcribe the candidate's audio, score it, and speak the next question."""
     try:
         interview_session = _get_interview_or_404(db, interview_id)
-        content = await file.read()
-        if len(content) > MAX_AUDIO_BYTES:
-            raise HTTPException(
-                status_code=400,
-                detail="That file is too large. Please keep recordings under 5 MB.",
-            )
-        if not content:
-            raise HTTPException(status_code=400, detail="The recording was empty. Please record again.")
+        silent = _form_flag(no_speech)
+        if silent:
+            user_message = "The candidate did not speak."
+        else:
+            if file is None:
+                raise HTTPException(status_code=400, detail="The recording was empty. Please record again.")
+            content = await file.read()
+            if len(content) > MAX_AUDIO_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail="That file is too large. Please keep recordings under 5 MB.",
+                )
+            if not content:
+                raise HTTPException(status_code=400, detail="The recording was empty. Please record again.")
+            user_message = await transcribe_audio_bytes(content, file.filename or "answer.webm", file.content_type or "")
 
         all_questions = (
             db.query(InterviewQuestion)
@@ -775,12 +1127,14 @@ async def process_video(
         if interview_session.status == "draft":
             raise HTTPException(status_code=400, detail="This interview is not ready yet.")
 
-        answered_questions = (
-            db.query(CandidateResponse)
+        answered_ids = {
+            row[0]
+            for row in db.query(CandidateResponse.question_id)
             .filter(CandidateResponse.interview_session_id == interview_session.id)
-            .count()
-        )
-        if answered_questions >= len(all_questions):
+            .all()
+        }
+        current_question = next((question for question in all_questions if question.id not in answered_ids), None)
+        if current_question is None:
             interview_session.status = "completed"
             db.commit()
             raise HTTPException(status_code=400, detail="Interview is already completed")
@@ -788,14 +1142,6 @@ async def process_video(
         if interview_session.status != "in_progress":
             interview_session.status = "in_progress"
             interview_session.actual_start_time = datetime.utcnow()
-
-        user_message = await transcribe_audio_bytes(content, file.filename or "answer.webm", file.content_type or "")
-        current_question = next(
-            (question for question in all_questions if question.sequence_number == answered_questions + 1),
-            None,
-        )
-        if current_question is None:
-            raise HTTPException(status_code=400, detail="Interview is already completed")
 
         response = CandidateResponse(
             interview_session_id=interview_session.id,
@@ -805,38 +1151,114 @@ async def process_video(
             timestamp=datetime.utcnow(),
         )
         db.add(response)
-        analysis = await analyze_response(current_question.question_text, user_message)
-        response.score = analysis.get("relevance_score", 0)
-        response.technical_accuracy = analysis.get("technical_score", 0)
-        response.clarity_score = analysis.get("clarity_score", 0)
-        response.ai_feedback = analysis.get("feedback", "")
-        response.improvement_suggestions = analysis.get("improvement_areas", "")
+        analysis = await analyze_response(
+            current_question.question_text,
+            user_message,
+            role_family=interview_session.role_family or "general",
+            dimension=current_question.dimension,
+            no_speech=silent,
+        )
+        _store_answer(response, analysis)
+        db.flush()
 
-        if answered_questions + 1 >= len(all_questions):
-            interview_session.status = "completed"
-            interview_session.actual_end_time = datetime.utcnow()
-            db.flush()
-            _finish_scores(db, interview_session)
+        mode = interview_session.question_mode or "preset"
+        job = interview_session.job_description
+        resume = interview_session.candidate_resume
+        spoken = None
+        if mode == "dynamic" and not current_question.is_follow_up and not analysis.get("not_assessed"):
+            follow_up = await maybe_follow_up_question(current_question.question_text, user_message, analysis)
+            if follow_up:
+                sequence = max(question.sequence_number or 0 for question in all_questions) + 1
+                _append_question(
+                    db,
+                    interview_session.id,
+                    {
+                        "question_text": follow_up,
+                        "dimension": current_question.dimension or "problem_solving",
+                        "assesses": "Follow-up",
+                        "key_points": "",
+                        "is_generated": True,
+                    },
+                    sequence=sequence,
+                    main_index=current_question.main_index or current_question.sequence_number,
+                    is_follow_up=True,
+                )
+                spoken = follow_up
+
+        if spoken is None and mode == "dynamic":
+            history_rows = (
+                db.query(CandidateResponse, InterviewQuestion)
+                .join(InterviewQuestion, CandidateResponse.question_id == InterviewQuestion.id)
+                .filter(CandidateResponse.interview_session_id == interview_session.id)
+                .order_by(InterviewQuestion.sequence_number)
+                .all()
+            )
+            asked_mains = {
+                question.main_index or question.sequence_number
+                for _, question in history_rows
+                if not question.is_follow_up
+            }
+            target = interview_session.main_question_target or 5
+            if len(asked_mains) < target:
+                covered = []
+                history = []
+                for answer, question in history_rows:
+                    history.append({"question": question.question_text, "answer": answer.response_text})
+                    if not question.is_follow_up and question.dimension and question.dimension not in covered:
+                        covered.append(question.dimension)
+                nxt = await generate_next_main_question(
+                    job.content if job else "",
+                    resume.content if resume else "",
+                    history,
+                    len(asked_mains) + 1,
+                    interview_session.role_family or "general",
+                    covered,
+                )
+                sequence = max(question.sequence_number or 0 for question in all_questions) + 1
+                _append_question(
+                    db,
+                    interview_session.id,
+                    nxt,
+                    sequence=sequence,
+                    main_index=len(asked_mains) + 1,
+                )
+                spoken = nxt["question_text"]
+            else:
+                interview_session.status = "completed"
+                interview_session.actual_end_time = datetime.utcnow()
+                _finish_scores(db, interview_session)
+        elif spoken is None:
+            remaining = [question for question in all_questions if question.id not in answered_ids and question.id != current_question.id]
+            if remaining:
+                spoken = remaining[0].question_text
+            else:
+                interview_session.status = "completed"
+                interview_session.actual_end_time = datetime.utcnow()
+                _finish_scores(db, interview_session)
+
+        if interview_session.status == "completed":
             ai_response = (
                 "Thank you for completing the interview. Your responses have been recorded. "
                 "We will review them and get back to you soon. Have a great day!"
             )
         else:
-            next_question = next(
-                (question for question in all_questions if question.sequence_number == answered_questions + 2),
-                None,
-            )
-            if next_question:
-                ai_response = f"Thank you for your response. Here's your next question: {next_question.question_text}"
-            else:
-                ai_response = "Thank you for your response."
+            ai_response = spoken or "Thank you."
 
+        answered_count = (
+            db.query(CandidateResponse)
+            .filter(CandidateResponse.interview_session_id == interview_session.id)
+            .count()
+        )
+        if mode == "dynamic":
+            total_main = interview_session.main_question_target or 5
+        else:
+            total_main = sum(1 for question in all_questions if not question.is_follow_up) or 1
         db.commit()
         audio_output = text_to_speech(ai_response)
         headers = {
             "X-Interview-Status": interview_session.status,
-            "X-Total-Questions": str(len(all_questions)),
-            "X-Answered-Questions": str(answered_questions + 1),
+            "X-Total-Questions": str(total_main),
+            "X-Answered-Questions": str(answered_count),
             "Access-Control-Expose-Headers": "X-Interview-Status, X-Total-Questions, X-Answered-Questions",
         }
         return StreamingResponse(iter([audio_output]), media_type="audio/mpeg", headers=headers)

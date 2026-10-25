@@ -2,7 +2,7 @@
 
 AI video interviews by [Abhilash N L](https://github.com/nlabhilash29).
 
-A candidate opens a link, checks the microphone and camera, and answers spoken questions out loud. The app transcribes the audio, scores each answer, and writes feedback. A recruiter signs in with a shared passcode, builds an interview from a job description and a resume, and reviews the report.
+A candidate opens a link and has a spoken conversation with an AI interviewer. The interviewer asks the next question on its own, transcribes the answer, and scores it. A recruiter creates the interview, copies a candidate link, and reads the results. The recruiter desk is open unless `RECRUITER_AUTH_REQUIRED` is turned on.
 
 ## Live demo
 
@@ -25,51 +25,53 @@ The Render service is on the free plan and sleeps when idle. The first request c
 
 **Candidate interview**
 
-- Practice interview from a job title, or a shareable link at `/interview/:id`.
-- Microphone and camera check before the first question. Only audio is recorded and transcribed. The camera is a framing preview and is not uploaded.
-- The current question is on screen, with "Question X of N" and a replay control. A blocked autoplay is explained instead of failing silently.
-- Record, then review the take and re-record or submit. A timer and recording dot auto-stop before the 5 MB upload limit.
-- After submit, the page shows a processing state and keeps Start and Stop disabled until the next question arrives.
+- The Interview tab opens a real interview from a link or ID. Practice lives on that same tab: "Want to warm up? Practice with a sample interview before the real one."
+- Deep links stay at `/interview/:id`.
+- Microphone and camera check, including a short room-noise calibration. Only audio is recorded and transcribed. The camera is a framing preview and is not uploaded.
+- One **Begin interview** click unlocks audio. After that there are no Start, Stop, Re-record, or Submit buttons. The interviewer speaks, then listens. About 2.8 seconds of silence after speech ends the answer. A live microphone level, "Listening…", and "Moving on in 2…" keep the state obvious. Resumed speech cancels the countdown.
+- No speech for about 15 seconds replays the question once, then moves on without a score. Answers stop before the 5 MB upload limit. "I'm done answering" is a small text fallback.
+- AI-generated interviews show "Question X of N" for main questions and "Follow-up" for a probe. At most one follow-up per main question.
 
 **Recruiter area**
 
-- `/recruiter` is separate from the candidate link. Candidates do not see the dashboard or other people's reports.
-- Sign-in uses a shared passcode (`RECRUITER_PASSCODE`). The browser keeps a short-lived token.
-- Searchable interview list with a status filter, instead of pasting raw ids.
-- Upload a job description and a resume, edit the generated questions, confirm them, and open the candidate link in one click.
+- Two tabs only: Interview and Recruiter. The recruiter page creates interviews and copies a candidate link. It does not start the interview.
+- Open by default. Set `RECRUITER_AUTH_REQUIRED=true` to require `RECRUITER_PASSCODE`. The passcode alone does not lock the desk.
+- Searchable interview list with a status filter.
+- Question mode at setup: **AI-generated questions** (default) or **Preset questions** (draft with AI, then edit). A role family picker weights the rubric. Main-question count defaults to 5.
 
 **Results**
 
-- Summary card with a recommendation, an overall score out of 10, and sub-scores.
-- Per-question cards with the question, transcript, score, feedback, and what to improve.
-- The per-question score is relevance. The overall score averages technical accuracy and communication, and the page says so.
+- Five dimensions, scored 1–10 only when the answer contains evidence: problem solving, communication, role knowledge, ownership and impact, collaboration. Missing evidence stays "Not assessed".
+- Role weights differ for Software Developer, Forward-Deployed Engineer, Product Manager, Sales, and a general mix. The report shows the weight, the evidence quote, and the nearest 1–10 anchor.
+- The recommendation is Strong yes, Yes, Mixed, No, or not enough evidence.
+- Older interviews that only have technical, communication, and cultural-fit scores still render with the earlier explanation.
 - Empty feedback labels are hidden. A missing model reply is retried, then replaced with a short fallback so Feedback is never blank.
 
 ## Architecture
 
 ```
 Browser (Vercel)
-  /                         practice setup
-  /interview/:id            candidate interview
-  /interview/:id/results    practice feedback
-  /recruiter                passcode, list, new interview
+  /                         Interview tab: open a link, or practice
+  /interview/:id            hands-free candidate interview
+  /interview/:id/results    score report
+  /recruiter                create interviews, copy links, list
   /recruiter/interviews/:id recruiter report
         |
         |  HTTPS, REACT_APP_API_URL
         v
 FastAPI (Render)
   /health, /mock-interview, /talk-video, /interview/:id/session
-  /recruiter/login and the report/list/upload routes (token required)
+  /recruiter/access         says whether a passcode is required
         |
         +-- Whisper      audio -> transcript
-        +-- Groq         questions and scores (JSON, then a text parser)
+        +-- Groq         questions, follow-ups, and rubric scores
         +-- ElevenLabs   question audio
         +-- SQLite or Postgres
 ```
 
 `frontend/ai-recruiter-frontend/vercel.json` rewrites client routes to `index.html`, so a refresh on `/interview/:id` or `/recruiter` still loads the app.
 
-Recruiter routes check an HMAC token derived from `RECRUITER_PASSCODE` (12 hours, stored in `localStorage`). If that variable is unset, those routes return HTTP 503 and name the missing variable. They are not left open. Practice interviews and candidate links still work.
+Recruiter routes are public unless `RECRUITER_AUTH_REQUIRED` is true. When that flag is on, they check an HMAC token derived from `RECRUITER_PASSCODE` (12 hours, stored in `localStorage`). If the flag is on and the passcode is unset, those routes return HTTP 503 and name the missing variable. Candidate interview links work either way.
 
 The API process starts even when a provider key is missing. The route that needs the key returns HTTP 503 and names it. `AI_STUB=1` skips Groq, Whisper, and ElevenLabs for a local demo.
 
@@ -127,7 +129,8 @@ Names only. Put real values in `backend/.env` and in the host's dashboard, not i
 | `ELEVENLABS_API_KEY` | Spoken questions |
 | `ELEVENLABS_MODEL_ID` | ElevenLabs model. Default is `eleven_flash_v2_5` |
 | `ELEVENLABS_VOICE_ID` | ElevenLabs voice |
-| `RECRUITER_PASSCODE` | Shared recruiter passcode. Required for the recruiter area |
+| `RECRUITER_AUTH_REQUIRED` | Set to `true` to lock the recruiter area. Off by default |
+| `RECRUITER_PASSCODE` | Shared passcode. Used only when `RECRUITER_AUTH_REQUIRED` is true |
 | `DATABASE_URL` | Postgres URL. Omit it locally to use SQLite |
 | `CORS_ORIGINS` | Extra browser origins, comma-separated |
 | `AI_STUB` | Set to `1` to skip the AI providers locally |
@@ -167,9 +170,10 @@ This fork is the work in [nlabhilash29/ai-recruiter](https://github.com/nlabhila
 
 - **Deployment fixes.** The API boots without every provider key and names the missing one with HTTP 503. Recordings are sent to Whisper in their real format. Question edits no longer write a column that does not exist. Retired Groq and ElevenLabs model ids are not the defaults. A clean frontend install no longer depends on `react-mic`.
 - **Feedback reliability.** Scores and feedback survive multiline labels, markdown headings, and JSON. Empty feedback is retried, then filled with a short fallback, and improvement notes are stored and shown.
-- **Candidate and recruiter separation.** Candidates use `/interview/:id`. Recruiters sign in at `/recruiter` and get a searchable list. Reports for real interviews stay behind the passcode.
-- **Results redesign.** Summary card, score bar, per-question cards, and a plain explanation of the two score scales.
-- **UX and accessibility.** Cold-start copy, device check, replay, re-record, processing state, recording timer, copy-link buttons, visible focus, labelled inputs, and `prefers-reduced-motion`.
+- **Candidate and recruiter separation.** Candidates use `/interview/:id`. Recruiters use `/recruiter` to create interviews, copy a candidate link, and open results. The desk is open unless `RECRUITER_AUTH_REQUIRED=true`.
+- **Hands-free interviews.** AI-generated or preset questions, browser voice detection, and a five-dimension rubric with role weights.
+- **Results redesign.** Summary card, score bars, per-question evidence, and a plain explanation of how the score was built. Older technical / communication / cultural-fit rows still render.
+- **UX and accessibility.** Cold-start copy, device check, spoken questions, visible listening state, copy-link buttons, visible focus, labelled inputs, and `prefers-reduced-motion`.
 - **Postgres-ready persistence.** `DATABASE_URL` works with Render's `postgres://` URLs. The old sample database and session files are not shipped.
 
 ## Acknowledgements

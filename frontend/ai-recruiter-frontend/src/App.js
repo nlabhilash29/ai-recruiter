@@ -23,7 +23,7 @@ function Shell({ variant, children }) {
         )}
         {variant === "app" && (
           <nav className="nav" aria-label="Primary">
-            <Link to="/">Practice</Link>
+            <Link to="/">Interview</Link>
             <Link to="/recruiter">Recruiter</Link>
           </nav>
         )}

@@ -70,6 +70,12 @@ class InterviewSession(Base):
     communication_score = Column(Float, default=0.0)
     cultural_fit_score = Column(Float, default=0.0)
     interviewer_notes = Column(Text, nullable=True)
+    question_mode = Column(String(32), default="dynamic")  # dynamic or preset
+    main_question_target = Column(Integer, default=5)
+    role_family = Column(String(64), nullable=True)
+    rubric = Column(JSON, nullable=True)
+    dimension_scores = Column(JSON, nullable=True)
+    recommendation = Column(Text, nullable=True)
     
     # Session data
     recording_url = Column(String(512), nullable=True)
@@ -92,6 +98,9 @@ class InterviewQuestion(Base):
     question_type = Column(String(50), nullable=False)  # technical, behavioral, experience
     category = Column(String(100), nullable=True)  # specific skill or competency
     sequence_number = Column(Integer, nullable=False)
+    main_index = Column(Integer, nullable=True)
+    is_follow_up = Column(Boolean, default=False)
+    dimension = Column(String(64), nullable=True)
     
     # Question metadata
     is_generated = Column(Boolean, default=True)
@@ -131,6 +140,8 @@ class CandidateResponse(Base):
     # AI Analysis
     ai_feedback = Column(Text, nullable=True)
     improvement_suggestions = Column(Text, nullable=True)
+    evidence = Column(Text, nullable=True)
+    dimension_scores = Column(JSON, nullable=True)
     
     # Relationships
     interview_session = relationship("InterviewSession", back_populates="responses")
