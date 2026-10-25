@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import axios from "axios";
 import { API_URL, friendlyError } from "../api";
 import ColdStart from "../components/ColdStart";
 import { createTurnController } from "../interviewTurn";
+import { liveAudioTracks } from "../recordingStream";
 import { calibrateThreshold, createVadController, levelPercent, MAX_ANSWER_MS } from "../vad";
 
 const MAX_UPLOAD_BYTES = 4.5 * 1024 * 1024;
@@ -60,21 +61,25 @@ export default function InterviewPage() {
   const phaseRef = useRef(phase);
   const mimeRef = useRef("");
   const listenEpochRef = useRef(0);
+  const calibrateRunRef = useRef(0);
 
   function move(next) {
     phaseRef.current = next;
     setPhase(next);
   }
 
-  function bindVideo(node) {
+  const attachPreview = useCallback((node) => {
     previewRef.current = node;
     const stream = streamRef.current;
     if (!node || !stream) return;
-    node.srcObject = stream;
-    node.play().catch(() => {
-      setCameraNote("The camera preview could not start. You can still continue, because only audio is used.");
-    });
-  }
+    if (node.srcObject !== stream) node.srcObject = stream;
+    const pending = node.play();
+    if (pending && pending.catch) {
+      pending.catch((playError) => {
+        if (!playError || playError.name === "AbortError") return;
+      });
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -134,41 +139,51 @@ export default function InterviewPage() {
 
   useEffect(() => {
     if (phase !== "device-check") return undefined;
-    let cancelled = false;
+    const run = calibrateRunRef.current + 1;
+    calibrateRunRef.current = run;
     let timer = 0;
+    const stale = () => calibrateRunRef.current !== run;
     async function calibrate() {
-      setError("");
-      setCameraNote("");
       setCalibrated(false);
       let stream = streamRef.current;
-      if (!stream || !stream.getAudioTracks().some((track) => track.readyState === "live")) {
+      const reusable = liveAudioTracks(stream).length > 0;
+      if (!reusable) {
         try {
           stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: true });
         } catch (requestError) {
           try {
             stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
-            if (!cancelled) {
+            if (!stale()) {
               setCameraNote("The camera is unavailable. You can still continue, because only audio is used.");
             }
           } catch (audioError) {
-            if (!cancelled) {
+            if (!stale()) {
               setError("The microphone is blocked. Allow microphone access in the browser, then try again.");
             }
             return;
           }
         }
       }
-      if (cancelled) {
-        stream.getTracks().forEach((track) => track.stop());
+      if (stale()) {
+        if (stream && stream !== streamRef.current) {
+          stream.getTracks().forEach((track) => track.stop());
+        }
         return;
       }
       streamRef.current = stream;
-      setHasVideo(stream.getVideoTracks().length > 0);
+      const videoLive = stream.getVideoTracks().some((track) => track.readyState === "live");
+      setHasVideo(videoLive);
+      if (videoLive) setCameraNote("");
       const context = await ensureContext();
+      if (stale()) return;
       const meter = wireMeter(context, stream);
       const started = Date.now();
       const samples = [];
       timer = window.setInterval(() => {
+        if (stale()) {
+          window.clearInterval(timer);
+          return;
+        }
         const value = rmsFrom(meter.analyser, meter.buffer);
         samples.push(value);
         setLevel(levelPercent(value));
@@ -181,7 +196,7 @@ export default function InterviewPage() {
     }
     calibrate();
     return () => {
-      cancelled = true;
+      calibrateRunRef.current += 1;
       window.clearInterval(timer);
     };
   }, [phase]);
@@ -309,40 +324,58 @@ export default function InterviewPage() {
     else if (!played) move("listening");
   }
 
+  function failMicrophone(message) {
+    setError(message);
+    move("mic-error");
+  }
+
   function startListening() {
     const stream = streamRef.current;
     const meter = meterRef.current;
-    if (!stream || !meter) {
-      setError("The microphone is blocked. Allow microphone access, then use Begin interview again.");
-      move("device-check");
+    const tracks = liveAudioTracks(stream);
+    if (!tracks.length || !meter) {
+      failMicrophone(
+        "The microphone stopped before recording could start. Check the microphone, then begin again."
+      );
       return;
     }
     const epoch = listenEpochRef.current + 1;
     listenEpochRef.current = epoch;
-    setError("");
     setCountdown(null);
-    move("listening");
     vadRef.current = createVadController({ threshold: thresholdRef.current });
     const mime = chooseMime();
     mimeRef.current = mime;
     let recorder;
-    try {
-      recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-    } catch (error) {
-      setError("The microphone is blocked. Allow microphone access, then use Begin interview again.");
-      move("device-check");
-      return;
-    }
     chunksRef.current = [];
     let bytes = 0;
-    recorder.ondataavailable = (event) => {
-      if (event.data && event.data.size) {
-        chunksRef.current.push(event.data);
-        bytes += event.data.size;
+    try {
+      if (!tracks.every((track) => track.readyState === "live")) {
+        throw new Error("ended");
       }
-    };
-    recorderRef.current = recorder;
-    recorder.start(250);
+      // Chrome refuses to start an audio-only recorder on a stream that still has a camera track.
+      const recording = new MediaStream(tracks);
+      recorder = mime ? new MediaRecorder(recording, { mimeType: mime }) : new MediaRecorder(recording);
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size) {
+          chunksRef.current.push(event.data);
+          bytes += event.data.size;
+        }
+      };
+      recorder.onerror = () => {
+        if (recorderRef.current !== recorder || recorder.state !== "recording") return;
+        failMicrophone("Recording stopped unexpectedly. Check the microphone, then begin again.");
+      };
+      recorderRef.current = recorder;
+      recorder.start(250);
+    } catch (error) {
+      recorderRef.current = null;
+      failMicrophone(
+        "The microphone could not start recording. Check the microphone, then begin again."
+      );
+      return;
+    }
+    setError("");
+    move("listening");
     const started = Date.now();
     window.clearInterval(listenTimerRef.current);
     listenTimerRef.current = window.setInterval(() => {
@@ -393,7 +426,7 @@ export default function InterviewPage() {
     unlockPlayer();
     const context = await ensureContext();
     const stream = streamRef.current;
-    if (!stream) {
+    if (!liveAudioTracks(stream).length) {
       setError("The microphone is blocked. Allow microphone access in the browser, then try again.");
       return;
     }
@@ -406,7 +439,7 @@ export default function InterviewPage() {
       if (played && turnRef.current.playbackEnded() === "listen") startListening();
     } catch (requestError) {
       setError(friendlyError(requestError, "The question audio could not be played."));
-      move("device-check");
+      move("mic-error");
     }
   }
 
@@ -421,7 +454,8 @@ export default function InterviewPage() {
   }
 
   const question = session?.current_question;
-  const inConversation = phase === "speaking" || phase === "listening" || phase === "thinking";
+  const inConversation =
+    phase === "speaking" || phase === "listening" || phase === "thinking" || phase === "mic-error";
   const statusText =
     phase === "speaking"
       ? "Interviewer is speaking…"
@@ -453,7 +487,7 @@ export default function InterviewPage() {
           </p>
           <div className="stage">
             {hasVideo ? (
-              <video ref={bindVideo} className="camera" autoPlay playsInline muted />
+              <video ref={attachPreview} className="camera" autoPlay playsInline muted />
             ) : (
               <div className="stage-placeholder">Camera preview appears when the check finishes.</div>
             )}
@@ -513,9 +547,14 @@ export default function InterviewPage() {
               </button>
             </p>
           ) : null}
+          {phase === "mic-error" ? (
+            <button type="button" className="btn btn-primary" onClick={() => move("device-check")}>
+              Check microphone again
+            </button>
+          ) : null}
           {hasVideo ? (
             <div className="stage">
-              <video ref={bindVideo} className="camera" autoPlay playsInline muted />
+              <video ref={attachPreview} className="camera" autoPlay playsInline muted />
             </div>
           ) : null}
         </section>
