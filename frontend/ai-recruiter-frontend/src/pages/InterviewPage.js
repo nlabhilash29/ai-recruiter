@@ -1,15 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import axios from "axios";
-import Webcam from "react-webcam";
-import { API_URL, candidateLink, friendlyError } from "../api";
+import { API_URL, friendlyError } from "../api";
 import ColdStart from "../components/ColdStart";
-import CopyButton from "../components/CopyButton";
+import { createTurnController } from "../interviewTurn";
 import { calibrateThreshold, createVadController, levelPercent, MAX_ANSWER_MS } from "../vad";
 
 const MAX_UPLOAD_BYTES = 4.5 * 1024 * 1024;
 const SILENT_WAV =
   "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+const AUDIO_CONSTRAINTS = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
 
 function chooseMime() {
   if (typeof MediaRecorder === "undefined" || typeof MediaRecorder.isTypeSupported !== "function") {
@@ -40,26 +44,36 @@ export default function InterviewPage() {
   const [hasVideo, setHasVideo] = useState(false);
   const [cameraNote, setCameraNote] = useState("");
   const [playbackBlocked, setPlaybackBlocked] = useState(false);
-  const [previewStream, setPreviewStream] = useState(null);
 
   const previewRef = useRef(null);
-  const previewStreamRef = useRef(null);
+  const streamRef = useRef(null);
   const audioContextRef = useRef(null);
+  const meterRef = useRef(null);
   const playerRef = useRef(null);
+  const playGenerationRef = useRef(0);
   const recorderRef = useRef(null);
-  const recordStreamRef = useRef(null);
   const chunksRef = useRef([]);
   const vadRef = useRef(null);
+  const turnRef = useRef(null);
   const listenTimerRef = useRef(0);
   const thresholdRef = useRef(0.03);
   const phaseRef = useRef(phase);
-  const turnRef = useRef(0);
   const mimeRef = useRef("");
-  const closingRef = useRef(false);
+  const listenEpochRef = useRef(0);
 
   function move(next) {
     phaseRef.current = next;
     setPhase(next);
+  }
+
+  function bindVideo(node) {
+    previewRef.current = node;
+    const stream = streamRef.current;
+    if (!node || !stream) return;
+    node.srcObject = stream;
+    node.play().catch(() => {
+      setCameraNote("The camera preview could not start. You can still continue, because only audio is used.");
+    });
   }
 
   useEffect(() => {
@@ -69,7 +83,7 @@ export default function InterviewPage() {
         const response = await axios.get(`${API_URL}/interview/${id}/session`, { timeout: 90000 });
         if (cancelled) return;
         setSession(response.data);
-        if (response.data.status === "completed") move("complete");
+        if (response.data.status === "completed") move("goodbye");
         else if (!response.data.ready) move("unavailable");
         else move("device-check");
       } catch (requestError) {
@@ -85,20 +99,9 @@ export default function InterviewPage() {
   }, [id]);
 
   useEffect(() => {
-    const video = previewRef.current;
-    if (!video || !previewStream) return undefined;
-    video.srcObject = previewStream;
-    video.play().catch(() => {
-      setCameraNote("The camera preview could not start. You can still continue, because only audio is used.");
-    });
-    return undefined;
-  }, [previewStream, hasVideo]);
-
-  useEffect(() => {
     return () => {
       window.clearInterval(listenTimerRef.current);
-      previewStreamRef.current?.getTracks().forEach((track) => track.stop());
-      recordStreamRef.current?.getTracks().forEach((track) => track.stop());
+      streamRef.current?.getTracks().forEach((track) => track.stop());
       if (audioContextRef.current) audioContextRef.current.close();
       if (playerRef.current) {
         playerRef.current.pause();
@@ -107,18 +110,26 @@ export default function InterviewPage() {
     };
   }, []);
 
-  function stopPreview() {
-    previewStreamRef.current?.getTracks().forEach((track) => track.stop());
-    previewStreamRef.current = null;
-    setPreviewStream(null);
-  }
-
   async function ensureContext() {
     if (!audioContextRef.current || audioContextRef.current.state === "closed") {
       audioContextRef.current = new AudioContext();
     }
     if (audioContextRef.current.state === "suspended") await audioContextRef.current.resume();
     return audioContextRef.current;
+  }
+
+  function wireMeter(context, stream) {
+    if (meterRef.current) return meterRef.current;
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 2048;
+    const source = context.createMediaStreamSource(stream);
+    const gain = context.createGain();
+    gain.gain.value = 0;
+    source.connect(analyser);
+    analyser.connect(gain);
+    gain.connect(context.destination);
+    meterRef.current = { analyser, buffer: new Uint8Array(analyser.fftSize) };
+    return meterRef.current;
   }
 
   useEffect(() => {
@@ -129,38 +140,36 @@ export default function InterviewPage() {
       setError("");
       setCameraNote("");
       setCalibrated(false);
-      let stream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-      } catch (requestError) {
+      let stream = streamRef.current;
+      if (!stream || !stream.getAudioTracks().some((track) => track.readyState === "live")) {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          if (!cancelled) {
-            setCameraNote("The camera is unavailable. You can still continue, because only audio is used.");
+          stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS, video: true });
+        } catch (requestError) {
+          try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: AUDIO_CONSTRAINTS });
+            if (!cancelled) {
+              setCameraNote("The camera is unavailable. You can still continue, because only audio is used.");
+            }
+          } catch (audioError) {
+            if (!cancelled) {
+              setError("The microphone is blocked. Allow microphone access in the browser, then try again.");
+            }
+            return;
           }
-        } catch (audioError) {
-          if (!cancelled) {
-            setError("The microphone is blocked. Allow microphone access in the browser, then try again.");
-          }
-          return;
         }
       }
       if (cancelled) {
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
-      previewStreamRef.current = stream;
+      streamRef.current = stream;
       setHasVideo(stream.getVideoTracks().length > 0);
-      setPreviewStream(stream);
       const context = await ensureContext();
-      const analyser = context.createAnalyser();
-      analyser.fftSize = 2048;
-      context.createMediaStreamSource(stream).connect(analyser);
-      const buffer = new Uint8Array(analyser.fftSize);
-      const samples = [];
+      const meter = wireMeter(context, stream);
       const started = Date.now();
+      const samples = [];
       timer = window.setInterval(() => {
-        const value = rmsFrom(analyser, buffer);
+        const value = rmsFrom(meter.analyser, meter.buffer);
         samples.push(value);
         setLevel(levelPercent(value));
         if (Date.now() - started >= 1200) {
@@ -174,39 +183,54 @@ export default function InterviewPage() {
     return () => {
       cancelled = true;
       window.clearInterval(timer);
-      stopPreview();
     };
   }, [phase]);
 
-  function armPlayer() {
+  function unlockPlayer() {
     const audio = playerRef.current || new Audio();
     playerRef.current = audio;
     audio.setAttribute("playsinline", "true");
-    if (!audio.src) audio.src = SILENT_WAV;
+    audio.src = SILENT_WAV;
     const pending = audio.play();
     if (pending && pending.catch) pending.catch(() => {});
     return audio;
   }
 
   function playUrl(url) {
-    const audio = armPlayer();
+    const audio = playerRef.current || unlockPlayer();
+    playerRef.current = audio;
+    const generation = playGenerationRef.current + 1;
+    playGenerationRef.current = generation;
     setPlaybackBlocked(false);
     move("speaking");
     return new Promise((resolve) => {
-      const finish = (blocked) => {
+      let settled = false;
+      let started = false;
+      const finish = (ok) => {
+        if (settled || generation !== playGenerationRef.current) return;
+        settled = true;
         audio.onended = null;
         audio.onerror = null;
-        resolve(!blocked);
+        resolve(ok);
       };
-      audio.onended = () => finish(false);
+      audio.pause();
+      audio.onended = () => {
+        if (started) finish(true);
+      };
       audio.onerror = () => finish(false);
       audio.src = url;
       const pending = audio.play();
-      if (pending && pending.catch) {
+      if (pending && pending.then) {
+        pending.then(() => {
+          started = true;
+          if (audio.ended) finish(true);
+        });
         pending.catch(() => {
           setPlaybackBlocked(true);
-          finish(true);
+          finish(false);
         });
+      } else {
+        started = true;
       }
     });
   }
@@ -226,11 +250,8 @@ export default function InterviewPage() {
     window.clearInterval(listenTimerRef.current);
     listenTimerRef.current = 0;
     const recorder = recorderRef.current;
-    const stream = recordStreamRef.current;
     return new Promise((resolve) => {
       const finish = () => {
-        stream?.getTracks().forEach((track) => track.stop());
-        recordStreamRef.current = null;
         recorderRef.current = null;
         const blob = new Blob(chunksRef.current, { type: mimeRef.current || "audio/webm" });
         resolve(blob);
@@ -240,7 +261,11 @@ export default function InterviewPage() {
         return;
       }
       recorder.onstop = finish;
-      recorder.stop();
+      try {
+        recorder.stop();
+      } catch (error) {
+        finish();
+      }
     });
   }
 
@@ -263,125 +288,122 @@ export default function InterviewPage() {
     const status = response.headers["x-interview-status"];
     const next = await axios.get(`${API_URL}/interview/${id}/session`, { timeout: 90000 });
     setSession(next.data);
+    const completed = status === "completed" || next.data.status === "completed" || !next.data.current_question;
+    const action = turnRef.current.uploaded({
+      nextKey: next.data.current_question?.id || "",
+      completed,
+    });
+    if (action === "listen") {
+      move("listening");
+      startListening();
+      return;
+    }
     const url = URL.createObjectURL(new Blob([response.data], { type: "audio/mpeg" }));
     const played = await playUrl(url);
     URL.revokeObjectURL(url);
-    if (!played) return;
-    if (status === "completed" || next.data.status === "completed" || !next.data.current_question) {
-      move("complete");
+    if (action === "goodbye" || completed) {
+      move("goodbye");
       return;
     }
-    await startListening();
+    if (played && turnRef.current.playbackEnded() === "listen") startListening();
+    else if (!played) move("listening");
   }
 
-  async function startListening() {
-    if (playerRef.current && !playerRef.current.paused && !playerRef.current.ended) return;
-    const turn = turnRef.current + 1;
-    turnRef.current = turn;
+  function startListening() {
+    const stream = streamRef.current;
+    const meter = meterRef.current;
+    if (!stream || !meter) {
+      setError("The microphone is blocked. Allow microphone access, then use Begin interview again.");
+      move("device-check");
+      return;
+    }
+    const epoch = listenEpochRef.current + 1;
+    listenEpochRef.current = epoch;
     setError("");
     setCountdown(null);
     move("listening");
+    vadRef.current = createVadController({ threshold: thresholdRef.current });
+    const mime = chooseMime();
+    mimeRef.current = mime;
+    let recorder;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      if (turnRef.current !== turn) {
-        stream.getTracks().forEach((track) => track.stop());
-        return;
-      }
-      recordStreamRef.current = stream;
-      const mime = chooseMime();
-      mimeRef.current = mime;
-      const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-      chunksRef.current = [];
-      let bytes = 0;
-      recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size) {
-          chunksRef.current.push(event.data);
-          bytes += event.data.size;
-        }
-      };
-      recorderRef.current = recorder;
-      recorder.start(250);
-      const context = await ensureContext();
-      const analyser = context.createAnalyser();
-      analyser.fftSize = 2048;
-      const source = context.createMediaStreamSource(stream);
-      source.connect(analyser);
-      const buffer = new Uint8Array(analyser.fftSize);
-      const started = Date.now();
-      if (!vadRef.current) vadRef.current = createVadController({ threshold: thresholdRef.current });
-      window.clearInterval(listenTimerRef.current);
-      listenTimerRef.current = window.setInterval(() => {
-        if (turnRef.current !== turn || phaseRef.current !== "listening") return;
-        if (playerRef.current && !playerRef.current.paused && !playerRef.current.ended) return;
-        const value = rmsFrom(analyser, buffer);
-        setLevel(levelPercent(value));
-        const decision = vadRef.current.step(value, Date.now());
-        setCountdown(decision.countdown);
-        if (bytes > MAX_UPLOAD_BYTES || Date.now() - started >= MAX_ANSWER_MS) {
-          closeTurn("max");
-          return;
-        }
-        if (decision.event === "silence" || decision.event === "max") closeTurn("answer");
-        else if (decision.event === "reprompt") closeTurn("reprompt");
-        else if (decision.event === "no-speech") closeTurn("no-speech");
-      }, 100);
-    } catch (requestError) {
+      recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+    } catch (error) {
       setError("The microphone is blocked. Allow microphone access, then use Begin interview again.");
       move("device-check");
+      return;
     }
+    chunksRef.current = [];
+    let bytes = 0;
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size) {
+        chunksRef.current.push(event.data);
+        bytes += event.data.size;
+      }
+    };
+    recorderRef.current = recorder;
+    recorder.start(250);
+    const started = Date.now();
+    window.clearInterval(listenTimerRef.current);
+    listenTimerRef.current = window.setInterval(() => {
+      if (listenEpochRef.current !== epoch || phaseRef.current !== "listening") return;
+      const player = playerRef.current;
+      if (player && !player.paused && !player.ended) return;
+      const value = rmsFrom(meter.analyser, meter.buffer);
+      setLevel(levelPercent(value));
+      const decision = vadRef.current.step(value, Date.now());
+      setCountdown(decision.countdown);
+      const tooLong = bytes > MAX_UPLOAD_BYTES || Date.now() - started >= MAX_ANSWER_MS;
+      const action = turnRef.current.vad(tooLong ? "max" : decision.event);
+      if (action === "wait" || action === "ignore") return;
+      window.clearInterval(listenTimerRef.current);
+      handleTurn(action, epoch);
+    }, 100);
   }
 
-  async function closeTurn(reason) {
-    if (closingRef.current) return;
-    closingRef.current = true;
-    const turn = turnRef.current;
-    turnRef.current += 1;
-    window.clearInterval(listenTimerRef.current);
-    const heardSpeech = Boolean(vadRef.current && vadRef.current.speechStarted);
+  async function handleTurn(action, epoch) {
+    if (listenEpochRef.current !== epoch) return;
+    listenEpochRef.current += 1;
     const blob = await stopRecorder();
     try {
-      if (turnRef.current !== turn + 1) return;
-      if (reason === "reprompt") {
-        vadRef.current?.markReprompted();
+      if (action === "replay") {
         const played = await speakCurrent();
-        if (played) await startListening();
+        if (played && turnRef.current.playbackEnded() === "listen") startListening();
         return;
       }
-      if (reason === "no-speech" || (reason === "manual" && !heardSpeech)) {
-        vadRef.current = createVadController({ threshold: thresholdRef.current });
-        await uploadAnswer(null, true);
-        return;
-      }
-      if (!blob || blob.size < 400) {
-        vadRef.current = createVadController({ threshold: thresholdRef.current });
-        await uploadAnswer(null, true);
-        return;
-      }
-      vadRef.current = createVadController({ threshold: thresholdRef.current });
-      await uploadAnswer(blob, false);
+      const silent = action === "upload-silent" || !blob || blob.size < 400;
+      await uploadAnswer(silent ? null : blob, silent);
     } catch (requestError) {
       const message = friendlyError(requestError, "Your answer could not be submitted. Please try again.");
       if (/already completed/i.test(message)) {
-        move("complete");
+        move("goodbye");
         return;
       }
       setError(message);
+      if (turnRef.current.mode === "uploading") {
+        turnRef.current.uploaded({ nextKey: session?.current_question?.id || "retry", completed: false });
+      }
       move("listening");
-      await startListening();
-    } finally {
-      closingRef.current = false;
+      if (turnRef.current.playbackEnded() === "listen" || turnRef.current.mode === "listening") startListening();
     }
   }
 
   async function beginInterview() {
     setError("");
-    armPlayer();
+    unlockPlayer();
+    const context = await ensureContext();
+    const stream = streamRef.current;
+    if (!stream) {
+      setError("The microphone is blocked. Allow microphone access in the browser, then try again.");
+      return;
+    }
+    wireMeter(context, stream);
+    turnRef.current = createTurnController();
+    turnRef.current.startPlayback(session?.current_question?.id || "question");
     move("speaking");
-    stopPreview();
-    vadRef.current = createVadController({ threshold: thresholdRef.current });
     try {
       const played = await speakCurrent();
-      if (played) await startListening();
+      if (played && turnRef.current.playbackEnded() === "listen") startListening();
     } catch (requestError) {
       setError(friendlyError(requestError, "The question audio could not be played."));
       move("device-check");
@@ -390,28 +412,14 @@ export default function InterviewPage() {
 
   async function hearQuestion() {
     try {
+      turnRef.current?.startPlayback(session?.current_question?.id || "question");
       const played = await speakCurrent();
-      if (played && phaseRef.current !== "complete") await startListening();
+      if (played && turnRef.current.playbackEnded() === "listen") startListening();
     } catch (requestError) {
       setError(friendlyError(requestError, "The question audio could not be played."));
     }
   }
 
-  async function replayQuestion() {
-    turnRef.current += 1;
-    window.clearInterval(listenTimerRef.current);
-    await stopRecorder();
-    vadRef.current?.restart();
-    setCountdown(null);
-    try {
-      const played = await speakCurrent();
-      if (played) await startListening();
-    } catch (requestError) {
-      setError(friendlyError(requestError, "The question audio could not be played."));
-    }
-  }
-
-  const link = candidateLink(id);
   const question = session?.current_question;
   const inConversation = phase === "speaking" || phase === "listening" || phase === "thinking";
   const statusText =
@@ -425,17 +433,7 @@ export default function InterviewPage() {
 
   return (
     <div className="page">
-      <div className="interview-top">
-        <div>
-          <p className="eyebrow">{session?.job_title || "Interview"}</p>
-          <h1>{session?.is_mock ? "Practice interview" : "Interview"}</h1>
-        </div>
-        <div className="id-row">
-          <CopyButton text={link} label="Copy link" />
-        </div>
-      </div>
-
-      <ColdStart active={phase === "loading"} />
+      <ColdStart active={phase === "loading" || phase === "thinking"} />
 
       {error ? <div className="alert alert-error">{error}</div> : null}
 
@@ -455,7 +453,7 @@ export default function InterviewPage() {
           </p>
           <div className="stage">
             {hasVideo ? (
-              <video ref={previewRef} className="camera" autoPlay playsInline muted />
+              <video ref={bindVideo} className="camera" autoPlay playsInline muted />
             ) : (
               <div className="stage-placeholder">Camera preview appears when the check finishes.</div>
             )}
@@ -482,10 +480,14 @@ export default function InterviewPage() {
         </section>
       )}
 
-      {inConversation && question && (
+      {inConversation && (
         <section className="card question-stage">
-          <p className="progress">{question.progress_label || `Question ${question.sequence_number}`}</p>
-          <h2 className="question-text">{question.question_text}</h2>
+          {question ? (
+            <>
+              <p className="progress">{question.progress_label || `Question ${question.sequence_number}`}</p>
+              <h2 className="question-text">{question.question_text}</h2>
+            </>
+          ) : null}
           <p className="status-line" role="status" aria-live="polite">
             {phase === "listening" ? <span className="rec-dot" aria-hidden="true" /> : null}
             {phase === "thinking" ? <span className="spinner" aria-hidden="true" /> : null}
@@ -500,9 +502,7 @@ export default function InterviewPage() {
                 <p className="countdown" role="status">
                   Moving on in {countdown}…
                 </p>
-              ) : (
-                <p className="muted">Speak naturally. A short pause ends the answer.</p>
-              )}
+              ) : null}
             </>
           )}
           {playbackBlocked ? (
@@ -513,29 +513,18 @@ export default function InterviewPage() {
               </button>
             </p>
           ) : null}
-          <div className="stage">
-            <Webcam audio={false} mirrored className="camera" videoConstraints={{ facingMode: "user" }} />
-          </div>
-          <p className="muted">Video is only for framing. It is not recorded.</p>
-          {phase === "listening" && (
-            <p className="fallback-row">
-              <button type="button" className="text-button" onClick={replayQuestion}>
-                Replay question
-              </button>
-              <button type="button" className="text-button" onClick={() => closeTurn("manual")}>
-                I'm done answering
-              </button>
-            </p>
-          )}
+          {hasVideo ? (
+            <div className="stage">
+              <video ref={bindVideo} className="camera" autoPlay playsInline muted />
+            </div>
+          ) : null}
         </section>
       )}
 
-      {phase === "complete" && (
+      {phase === "goodbye" && (
         <section className="card">
-          <h2>Interview complete</h2>
-          <p>Thank you. Your answers were recorded.</p>
-          <Link className="btn btn-primary" to={`/interview/${id}/results`}>
-            See the results
+          <Link className="btn btn-primary" to="/candidate">
+            Go back
           </Link>
         </section>
       )}

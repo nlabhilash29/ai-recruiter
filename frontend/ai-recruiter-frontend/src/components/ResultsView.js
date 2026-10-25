@@ -54,12 +54,10 @@ export default function ResultsView({ report }) {
   return (
     <div className="results">
       <article className="summary-card">
-        <p className="eyebrow">
-          {report.job_description?.title || "Interview"}
-          {report.candidate?.name ? ` · ${report.candidate.name}` : ""}
-          {scoring.rubric?.role_label ? ` · ${scoring.rubric.role_label}` : ""}
-        </p>
-        <h2>{summary.overall_recommendation || "Results"}</h2>
+        <h2>
+          {[report.candidate?.name, report.job_description?.title].filter(Boolean).join(" · ") || "Interview"}
+        </h2>
+        <p className="lede">{summary.overall_recommendation || "Results"}</p>
         <div className="overall-score">
           <p className="overall-number">
             <span>{overall || "—"}</span>

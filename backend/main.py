@@ -13,7 +13,7 @@ import requests
 from datetime import datetime
 from typing import Optional
 
-from file_processing import extract_candidate_info, extract_job_details, process_jd_file, process_resume_file
+from file_processing import extract_candidate_info, extract_job_details, process_jd_file, process_resume_file, short_role_title
 from question_generation import (
     analyze_response,
     generate_interview_questions,
@@ -313,12 +313,12 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
         },
         "job_description": {
             "id": job.id if job else None,
-            "title": job.title if job else None,
+            "title": _public_title(job) if job else None,
             "company": job.company if job else None,
         },
         "candidate": {
             "id": resume.id if resume else None,
-            "name": resume.candidate_name if resume else None,
+            "name": _candidate_label(interview),
             "email": resume.email if resume else None,
         },
         "scoring": {
@@ -378,13 +378,14 @@ def _candidate_view(interview: InterviewSession) -> dict:
     return {
         "interview_id": interview.id,
         "status": interview.status,
-        "job_title": interview.job_description.title if interview.job_description else None,
+        "job_title": _public_title(interview.job_description),
         "company": interview.job_description.company if interview.job_description else None,
         "is_mock": _is_mock(interview),
         "question_mode": mode,
         "total_questions": total_main,
         "main_question_target": total_main,
         "answered_questions": len(answered_ids),
+        "candidate_name": _candidate_label(interview),
         "current_question": None
         if not current
         else {
@@ -482,6 +483,8 @@ async def upload_resume(
 
 QUESTION_LIMIT = 5
 DOCUMENTS_REQUIRED = "A job description and a resume are both required."
+CLOSING_LINE = "That's the end of the interview. Thank you for your time."
+_PLACEHOLDER_NAMES = {"", "unknown candidate", "mock candidate"}
 
 
 def _evaluation(plan: dict) -> list:
@@ -594,11 +597,28 @@ def _documents_required():
     raise HTTPException(status_code=400, detail=DOCUMENTS_REQUIRED)
 
 
+def _candidate_label(interview: InterviewSession) -> str:
+    typed = " ".join((getattr(interview, "candidate_display_name", None) or "").split())
+    if typed:
+        return typed[:80]
+    resume = interview.candidate_resume
+    name = " ".join(((resume.candidate_name if resume else "") or "").split())
+    if name.lower() in _PLACEHOLDER_NAMES:
+        return "Candidate"
+    return name[:80]
+
+
+def _public_title(job: Optional[JobDescription]) -> str:
+    if job is None:
+        return "Role"
+    return short_role_title(job.content or "", fallback=(job.title or "Role"))
+
+
 def _job_from_text(db: Session, content: str, company: Optional[str] = None) -> JobDescription:
     details = extract_job_details(content)
     job = JobDescription(
         id=str(uuid.uuid4()),
-        title=details["title"],
+        title=short_role_title(content),
         company=company or details["company"],
         content=content,
         file_name=None,
@@ -758,6 +778,22 @@ async def get_candidate_session(interview_id: str, db: Session = Depends(get_db)
     return _candidate_view(interview)
 
 
+@app.post("/interview/{interview_id}/candidate")
+async def set_candidate_name(
+    interview_id: str,
+    candidate_name: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    interview = _get_interview_or_404(db, interview_id)
+    name = " ".join((candidate_name or "").split())
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter your name.")
+    interview.candidate_display_name = name[:80]
+    interview.updated_at = datetime.utcnow()
+    db.commit()
+    return {"interview_id": interview.id, "candidate_name": interview.candidate_display_name}
+
+
 @app.post("/interview/{interview_id}/speak")
 async def speak_current_question(interview_id: str, db: Session = Depends(get_db)):
     interview = _get_interview_or_404(db, interview_id)
@@ -880,6 +916,7 @@ async def search_interviews(
         query = query.filter(
             or_(
                 CandidateResume.candidate_name.ilike(like),
+                InterviewSession.candidate_display_name.ilike(like),
                 JobDescription.company.ilike(like),
                 JobDescription.title.ilike(like),
                 InterviewSession.id.ilike(like),
@@ -893,9 +930,9 @@ async def search_interviews(
     return [
         {
             "interview_id": interview.id,
-            "candidate_name": interview.candidate_resume.candidate_name if interview.candidate_resume else None,
+            "candidate_name": _candidate_label(interview),
             "company": interview.job_description.company if interview.job_description else None,
-            "job_title": interview.job_description.title if interview.job_description else None,
+            "job_title": _public_title(interview.job_description),
             "status": interview.status,
             "created_at": interview.created_at.isoformat() if interview.created_at else None,
             "overall_score": interview.overall_score,
@@ -930,6 +967,7 @@ def get_or_create_mock_resume(db: Session) -> CandidateResume:
 @app.post("/mock-interview")
 async def create_mock_interview(
     job_role: str = Form(""),
+    candidate_name: str = Form(""),
     jd_text: str = Form(""),
     resume_text: str = Form(""),
     question_mode: str = Form(""),
@@ -943,8 +981,11 @@ async def create_mock_interview(
         _ = (job_role, question_mode, main_question_target, role_family, questions_json)
         jd_body = (jd_text or "").strip()
         resume_body = (resume_text or "").strip()
+        typed_name = " ".join((candidate_name or "").split())
         if not jd_body or not resume_body:
             _documents_required()
+        if not typed_name:
+            raise HTTPException(status_code=400, detail="Enter your name.")
         job_description = _job_from_text(db, jd_body, company="Mock Company")
         jd_content = job_description.content
         title = job_description.title
@@ -960,6 +1001,7 @@ async def create_mock_interview(
             main_question_target=QUESTION_LIMIT,
             role_family=plan["role_family"],
             rubric=plan,
+            candidate_display_name=typed_name[:80],
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow(),
         )
@@ -978,6 +1020,8 @@ async def create_mock_interview(
         return {
             "interview_id": session_id,
             "job_role": title,
+            "job_title": title,
+            "candidate_name": typed_name[:80],
             "status": "ready",
             "question_mode": "dynamic",
             "main_question_target": QUESTION_LIMIT,
@@ -1194,18 +1238,19 @@ async def process_video(
             timestamp=datetime.utcnow(),
         )
         db.add(response)
+        job = interview_session.job_description
         analysis = await analyze_response(
             current_question.question_text,
             user_message,
             role_family=interview_session.role_family or "general",
             dimension=current_question.dimension,
             no_speech=silent,
+            job_text=job.content if job else "",
         )
         _store_answer(response, analysis)
         db.flush()
 
         mode = interview_session.question_mode or "preset"
-        job = interview_session.job_description
         resume = interview_session.candidate_resume
         spoken = None
         # New interviews are five main questions. A follow-up already stored on an older
@@ -1262,10 +1307,7 @@ async def process_video(
                 _finish_scores(db, interview_session)
 
         if interview_session.status == "completed":
-            ai_response = (
-                "Thank you for completing the interview. Your responses have been recorded. "
-                "We will review them and get back to you soon. Have a great day!"
-            )
+            ai_response = CLOSING_LINE
         else:
             ai_response = spoken or "Thank you."
 
