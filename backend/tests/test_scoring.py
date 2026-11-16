@@ -10,7 +10,7 @@ os.environ.setdefault("GROQ_API_KEY", "")
 os.environ.setdefault("OPENAI_API_KEY", "")
 os.environ.setdefault("ELEVENLABS_API_KEY", "")
 
-from question_generation import PROMPT_VERSION, analyze_response, generate_next_main_question
+from question_generation import ANALYSIS_RESPONSE_FORMAT, PROMPT_VERSION, analyze_response, generate_next_main_question
 from rubric import DIMENSIONS
 
 ANSWER = (
@@ -20,6 +20,13 @@ ANSWER = (
 
 
 class ScoringFallbackTests(unittest.TestCase):
+    def test_scoring_schema_accepts_null_for_unassessed_scores(self):
+        properties = ANALYSIS_RESPONSE_FORMAT["json_schema"]["schema"]["properties"]
+        for name in ("relevance_score", "clarity_score", "technical_score"):
+            self.assertIn("null", properties[name]["type"])
+        for name, spec in properties["dimension_scores"]["properties"].items():
+            self.assertIn("null", spec["type"], name)
+
     def test_scoring_failure_is_not_assessed(self):
         previous_stub = os.environ.get("AI_STUB")
         previous_traces = os.environ.get("AI_RECRUITER_TRACES")

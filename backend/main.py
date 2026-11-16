@@ -79,6 +79,7 @@ app.add_middleware(
 
 engine, SessionLocal, NORMALIZED_DATABASE_URL = build_session_factory()
 logger.info("Database ready (%s)", NORMALIZED_DATABASE_URL.split("://", 1)[0])
+observability.start_background_check()
 
 ALLOWED_DOCUMENT_TYPES = {".pdf", ".docx", ".txt"}
 MAX_FILE_SIZE = 5 * 1024 * 1024
@@ -138,6 +139,12 @@ async def health():
             "langfuse": observability.langfuse_configured(),
         },
     }
+
+
+@app.post("/recruiter/langfuse/test")
+async def langfuse_connectivity_test(_: None = Depends(require_recruiter)):
+    """Send one span to Langfuse and return its status. The body has no secrets."""
+    return observability.send_test_trace()
 
 
 @app.post("/recruiter/login")

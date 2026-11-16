@@ -134,6 +134,15 @@ class FeedbackTests(unittest.TestCase):
         self.assertIn('"needs, a comma"', payload)
         self.assertIn('"Say ""hello"""', payload)
 
+    def test_langfuse_probe_reports_that_keys_are_missing(self):
+        response = self.client.post("/recruiter/langfuse/test")
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body["configured"])
+        self.assertFalse(body["ok"])
+        self.assertNotIn("sk-", response.text)
+        self.assertNotIn("pk-", response.text)
+
 
 if __name__ == "__main__":
     unittest.main()
