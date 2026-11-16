@@ -135,6 +135,12 @@ Names only. Put real values in `backend/.env` and in the host's dashboard, not i
 | `DATABASE_URL` | Postgres URL. Omit it locally to use SQLite |
 | `CORS_ORIGINS` | Extra browser origins, comma-separated |
 | `AI_STUB` | Set to `1` to skip the AI providers locally |
+| `LANGFUSE_PUBLIC_KEY` | Langfuse public key. Tracing stays local until this, the secret, and the host are all set |
+| `LANGFUSE_SECRET_KEY` | Langfuse secret key |
+| `LANGFUSE_HOST` | Langfuse host for the project region, such as `https://us.cloud.langfuse.com` |
+| `AI_RECRUITER_TRACES` | Set to `off` to disable traces. On by default outside tests |
+| `TRACES_DIR` | Folder for local JSONL traces. Default is `backend/.traces` |
+| `MODEL_PRICES_JSON` | Optional token prices in USD per 1,000,000 tokens |
 
 Do not set `llama3-70b-8192` or `eleven_monolingual_v1`. Those model ids were removed by the providers.
 
@@ -145,6 +151,41 @@ Do not set `llama3-70b-8192` or `eleven_monolingual_v1`. Those model ids were re
 | `REACT_APP_API_URL` | FastAPI origin, no trailing slash. Read at build time |
 
 Locally this is `http://localhost:8000`. On Vercel it is the Render origin. Changing it requires a new Vercel deploy.
+
+## Observability and quality
+
+Each interview is one trace. The Langfuse session id is the interview id, and the trace id is that id with the dashes removed, so every later request joins the same trace. A span records the model, the prompt, the reply, token usage, latency, estimated cost, and which structured-output path and retries were used. Spans cover question generation, transcription, scoring, the next question, a follow-up when one is asked, and speech.
+
+Traces are written to `backend/.traces/*.jsonl` whenever tracing is on. They are also sent to Langfuse when `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` are all set. Use the host for the project's region. A missing host, a refused key, or a network error leaves the interview running and keeps the local file. Emails and phone numbers are masked before they are written. Unit tests leave tracing off unless `AI_RECRUITER_TRACES=1`.
+
+Cost is estimated from token counts. The built-in table prices `openai/gpt-oss-120b` at $0.15 per million input tokens and $0.60 per million output tokens. Replace those rates with `MODEL_PRICES_JSON` when the invoice differs.
+
+On the recruiter report, **How this score was built** shows the evidence check, model, latency, cost, prompt version, and a fallback badge. The confidence line is deterministic: it checks that the evidence quote is in the transcript, that a dimension was not scored without a quote, that the answer is not too thin, and that a fallback was not used. It does not call a model. When Langfuse is configured, the panel links to that interview's trace.
+
+If scoring fails, the answer stays **Not assessed — scoring unavailable**, with empty dimension scores. Silence and answers that are too thin to score use that same empty state. A fallback (default questions, a thin answer, or a scoring failure) is an error event on the trace.
+
+Thumbs on a question save a recruiter verdict: helpful or not, an optional reason (score too high, score too low, evidence not in the answer, bad question, transcription error, other), an optional 1–10 override, and a note. The verdict is stored on the answer and, when Langfuse is configured, posted as a score on the trace. Export it with:
+
+```bash
+curl -o feedback.csv https://ai-recruiter-x7qm.onrender.com/recruiter/feedback.csv
+```
+
+or, from `backend/`:
+
+```bash
+python scripts/export_feedback.py --output feedback.csv
+```
+
+`docs/error-analysis.md` is the worksheet for sorting that export into the failure taxonomy.
+
+**Demo**
+
+1. Set the three `LANGFUSE_*` variables on Render and redeploy. `GET /health` reports `observability.langfuse: true`.
+2. Run one interview. Open the recruiter report. Each question shows how the score was built, and **Open this interview in Langfuse** opens the trace with a span per step.
+3. Mark one score **Not helpful**, choose **Evidence not in the answer**, optionally enter a score override, and save. The same trace in Langfuse gains a `recruiter.vote` score.
+4. Download `/recruiter/feedback.csv` and drop the row into `docs/error-analysis.md`.
+
+With `AI_STUB=1` and no Langfuse keys, the report still shows the panel from the stub score, and the trace file is local only.
 
 ## Deployment
 

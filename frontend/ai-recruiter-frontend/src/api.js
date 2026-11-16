@@ -1,3 +1,5 @@
+import axios from "axios";
+
 function normalizeApiUrl(value) {
   const trimmed = String(value || "").trim().replace(/\/$/, "");
   if (trimmed && trimmed !== "undefined") return trimmed;
@@ -104,4 +106,13 @@ export function formatScore(value) {
 
 export function candidateLink(interviewId) {
   return `${window.location.origin}/interview/${interviewId}`;
+}
+
+export async function saveScoreFeedback(interviewId, responseId, payload) {
+  const response = await axios.post(
+    `${API_URL}/interview/${interviewId}/responses/${responseId}/feedback`,
+    payload,
+    { headers: { ...authHeaders(), "Content-Type": "application/json" }, timeout: 30000 }
+  );
+  return response.data;
 }

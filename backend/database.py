@@ -21,6 +21,12 @@ _ADDED_COLUMNS = {
         "rubric": "TEXT",
         "dimension_scores": "TEXT",
         "recommendation": "TEXT",
+        "trace_id": "VARCHAR(64)",
+        "prompt_version": "VARCHAR(64)",
+        "model": "VARCHAR(80)",
+        "latency_ms": "INTEGER",
+        "cost_usd": "FLOAT",
+        "fallback_used": "VARCHAR(64)",
     },
     "interview_questions": {
         "main_index": "INTEGER",
@@ -30,6 +36,12 @@ _ADDED_COLUMNS = {
     "candidate_responses": {
         "evidence": "TEXT",
         "dimension_scores": "TEXT",
+        "trace_id": "VARCHAR(64)",
+        "prompt_version": "VARCHAR(64)",
+        "model": "VARCHAR(80)",
+        "latency_ms": "INTEGER",
+        "cost_usd": "FLOAT",
+        "fallback_used": "VARCHAR(64)",
     },
 }
 
@@ -55,6 +67,8 @@ def create_db_engine(url: str | None = None):
 def ensure_columns(engine) -> None:
     """Add columns introduced after the first deploy. Old rows stay readable."""
     inspector = inspect(engine)
+    if hasattr(inspector, "clear_cache"):
+        inspector.clear_cache()
     existing_tables = set(inspector.get_table_names())
     dialect = engine.dialect.name
     with engine.begin() as connection:

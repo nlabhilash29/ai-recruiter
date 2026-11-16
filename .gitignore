@@ -34,6 +34,10 @@ logs/
 # Environment variables
 *.env
 
+# Local interview traces
+.traces/
+backend/.traces/
+
 # MacOS specific
 .DS_Store
 

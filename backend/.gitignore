@@ -48,6 +48,9 @@ database.json
 logs/
 log/
 
+# Local interview traces
+.traces/
+
 # Coverage reports
 htmlcov/
 .coverage
