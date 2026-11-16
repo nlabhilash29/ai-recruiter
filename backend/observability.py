@@ -4,10 +4,12 @@ The trace id is the interview id with dashes removed, so every request in that
 interview lands on the same trace. The Langfuse session id is the interview id.
 
 Spans are written to a local JSONL file whenever tracing is on. They are also
-posted to Langfuse's public ingestion API when ``LANGFUSE_PUBLIC_KEY``,
-``LANGFUSE_SECRET_KEY``, and ``LANGFUSE_HOST`` are all set. That is the same
-API the Langfuse Python SDK uses. A failed export is logged and swallowed:
-tracing never changes the interview response.
+sent to Langfuse as OpenTelemetry traces (``POST /api/public/otel/v1/traces``
+with ``x-langfuse-ingestion-version: 4``) when ``LANGFUSE_PUBLIC_KEY``,
+``LANGFUSE_SECRET_KEY``, and ``LANGFUSE_HOST`` are all set. The legacy
+``/api/public/ingestion`` batch stopped accepting traces on 16 November 2026
+and answers HTTP 207 while dropping every event. A failed export is logged
+and swallowed: tracing never changes the interview response.
 
 Tracing stays off under unittest and pytest unless ``AI_RECRUITER_TRACES=1``.
 Emails and phone numbers are masked before anything is written.
@@ -58,6 +60,11 @@ _queue: queue.Queue | None = None
 _worker_started = False
 _worker_lock = threading.Lock()
 _file_lock = threading.Lock()
+_project_cache: tuple[str, str, str] | None = None
+_project_lock = threading.Lock()
+_logged_ingestion_success = False
+_SECRET_RE = re.compile(r"(?:pk|sk)-lf-[A-Za-z0-9_\-]+")
+_BASIC_RE = re.compile(r"Basic\s+[A-Za-z0-9+/=]+", re.IGNORECASE)
 
 
 def _flag(name: str) -> str:
@@ -105,9 +112,13 @@ def trace_id_for(interview_id: str) -> str:
 
 
 def trace_url(trace_id: str | None) -> str | None:
+    """Link Langfuse actually opens: ``/project/<projectId>/traces/<traceId>``."""
     if not trace_id or not langfuse_configured():
         return None
-    return f"{langfuse_host()}/trace/{trace_id}"
+    project = cached_project_id()
+    if not project:
+        return None
+    return f"{langfuse_host()}/project/{project}/traces/{trace_id}"
 
 
 def mask_text(value: str) -> str:
@@ -437,101 +448,238 @@ def load(trace_id: str, folder: Path | None = None) -> list[dict]:
     return spans
 
 
-def _langfuse_headers() -> dict:
+def redact_langfuse_text(value: str) -> str:
+    """Drop keys and Authorization headers before a Langfuse body is logged."""
+    cleaned = _SECRET_RE.sub("[redacted-key]", value or "")
+    cleaned = _BASIC_RE.sub("Basic [redacted]", cleaned)
+    return cleaned[:2000]
+
+
+def _auth_headers(*, otel: bool = False, content_type: bool = True) -> dict:
     token = base64.b64encode(f"{_flag('LANGFUSE_PUBLIC_KEY')}:{_flag('LANGFUSE_SECRET_KEY')}".encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Basic {token}"}
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    if otel:
+        headers["x-langfuse-ingestion-version"] = "4"
+    return headers
 
 
-def post_langfuse(url: str, body: dict, headers: dict) -> int:
-    request = urllib.request.Request(url, data=json.dumps(body, default=str).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=3) as response:
-        return int(response.status)
+def post_langfuse(url: str, body: dict | None, headers: dict, method: str = "POST") -> tuple[int, str]:
+    """Return ``(status, body)``. HTTP errors are returned, not raised."""
+    data = None if body is None or method == "GET" else json.dumps(body, default=str).encode()
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            return int(response.status), raw
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        return int(exc.code), raw
+    except Exception as exc:
+        return 0, exc.__class__.__name__
 
 
-def _langfuse_batch(span_obj: _Span, payload: dict) -> dict:
-    attributes = payload["attributes"]
-    metadata = {
-        key: value
-        for key, value in attributes.items()
-        if key not in {"prompt", "reply", "transcript", "text"}
+def langfuse_errors(status: int, body: str) -> tuple[bool, list[str]]:
+    """Whether Langfuse accepted the call, plus messages safe to log.
+
+    HTTP 207 is the legacy ingestion response. It is a failure when the body
+    lists per-event errors, which is how trace events are rejected after the
+    November 2026 sunset while the status still looks successful.
+    """
+    messages: list[str] = []
+    parsed: Any = None
+    if body:
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = None
+    if isinstance(parsed, dict):
+        errors = parsed.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                if isinstance(item, dict):
+                    code = item.get("status")
+                    detail = item.get("message") or item.get("error") or ""
+                    label = item.get("error") or "error"
+                    text = f"{label}: {detail}".strip(": ").strip()
+                    try:
+                        numeric = int(code) if code is not None else 400
+                    except (TypeError, ValueError):
+                        numeric = 400
+                    if numeric >= 400:
+                        messages.append(redact_langfuse_text(text or "event rejected"))
+                elif item:
+                    messages.append(redact_langfuse_text(str(item)))
+        if status >= 400:
+            for key in ("message", "error"):
+                if parsed.get(key) and str(parsed[key]) not in messages:
+                    messages.append(redact_langfuse_text(str(parsed[key])))
+    if status >= 400 or status == 0:
+        if not messages:
+            messages.append(redact_langfuse_text(body or f"HTTP {status}"))
+        return False, messages
+    if messages:
+        return False, messages
+    if 200 <= status < 300:
+        return True, []
+    return False, [redact_langfuse_text(body or f"HTTP {status}")]
+
+
+def _otel_value(value: Any) -> dict:
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return {"arrayValue": {"values": [{"stringValue": item} for item in value]}}
+    if isinstance(value, (dict, list)):
+        return {"stringValue": json.dumps(value, ensure_ascii=False, default=str)[:MAX_TEXT]}
+    return {"stringValue": str(value)[:MAX_TEXT]}
+
+
+def _otel_attributes(pairs: dict) -> list[dict]:
+    attributes = []
+    for key, value in pairs.items():
+        if value is None:
+            continue
+        attributes.append({"key": key, "value": _otel_value(value)})
+    return attributes
+
+
+def _json_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def otel_traces(payload: dict) -> dict:
+    """One finished span as an OTLP/HTTP JSON export body.
+
+    Attribute names follow Langfuse's OpenTelemetry mapping: session id,
+    observation type, model, token usage, and cost. Integer attributes use
+    strings because OTLP JSON encodes int64 that way. Nulls are omitted.
+    """
+    attributes = payload.get("attributes") or {}
+    is_generation = payload.get("name") == "llm.chat"
+    pairs: dict[str, Any] = {
+        "langfuse.observation.type": "generation" if is_generation else "span",
+        "langfuse.trace.name": "interview",
+        "langfuse.trace.tags": ["ai-recruiter"],
+        "langfuse.session.id": payload.get("session_id"),
+        "langfuse.observation.level": "ERROR" if payload.get("status") == "ERROR" else "DEFAULT",
+        "langfuse.observation.status_message": payload.get("status_message") or None,
     }
-    level = "ERROR" if payload["status"] == "ERROR" else "DEFAULT"
-    observation = {
-        "id": span_obj.span_id,
-        "traceId": span_obj.trace_id,
-        "name": span_obj.name,
-        "startTime": payload["start"],
-        "endTime": payload["end"],
-        "metadata": metadata,
-        "level": level,
-        "statusMessage": payload["status_message"] or None,
+    observed_input = attributes.get("prompt")
+    if observed_input is None:
+        observed_input = attributes.get("text")
+    if observed_input is None:
+        observed_input = attributes.get("transcript")
+    pairs["langfuse.observation.input"] = _json_text(observed_input)
+    pairs["langfuse.observation.output"] = _json_text(attributes.get("reply"))
+    if attributes.get("model"):
+        pairs["gen_ai.request.model"] = attributes["model"]
+        pairs["langfuse.observation.model.name"] = attributes["model"]
+    usage: dict[str, int] = {}
+    if attributes.get("input_tokens") is not None:
+        usage["input"] = int(attributes["input_tokens"])
+        pairs["gen_ai.usage.input_tokens"] = usage["input"]
+    if attributes.get("output_tokens") is not None:
+        usage["output"] = int(attributes["output_tokens"])
+        pairs["gen_ai.usage.output_tokens"] = usage["output"]
+    if usage:
+        pairs["langfuse.observation.usage_details"] = json.dumps(usage)
+    if isinstance(attributes.get("cost_usd"), (int, float)):
+        pairs["langfuse.observation.cost_details"] = json.dumps({"total": attributes["cost_usd"]})
+    reserved = {
+        "prompt",
+        "reply",
+        "text",
+        "transcript",
+        "model",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cost_usd",
     }
-    if span_obj.parent_id:
-        observation["parentObservationId"] = span_obj.parent_id
-    if span_obj.name == "llm.chat":
-        observation["input"] = attributes.get("prompt")
-        observation["output"] = attributes.get("reply")
-        observation["model"] = attributes.get("model")
-        usage = {}
-        if attributes.get("input_tokens") is not None:
-            usage["input"] = attributes.get("input_tokens")
-        if attributes.get("output_tokens") is not None:
-            usage["output"] = attributes.get("output_tokens")
-        if attributes.get("total_tokens") is not None:
-            usage["total"] = attributes.get("total_tokens")
-        if attributes.get("cost_usd") is not None:
-            usage["totalCost"] = attributes.get("cost_usd")
-        if usage:
-            usage["unit"] = "TOKENS"
-            observation["usage"] = usage
-        event_type = "generation-create"
-    else:
-        observation["input"] = attributes.get("prompt") or attributes.get("text") or attributes.get("transcript")
-        observation["output"] = attributes.get("reply")
-        event_type = "span-create"
-    batch = [
-        {
-            "id": str(uuid.uuid4()),
-            "type": "trace-create",
-            "timestamp": payload["start"],
-            "body": {
-                "id": span_obj.trace_id,
-                "timestamp": payload["start"],
-                "name": "interview",
-                "sessionId": span_obj.session_id,
-                "tags": ["ai-recruiter"],
-                "metadata": {"service": SERVICE},
-            },
-        },
-        {
-            "id": str(uuid.uuid4()),
-            "type": event_type,
-            "timestamp": payload["start"],
-            "body": observation,
-        },
-    ]
-    for item in payload["events"]:
-        batch.append(
+    for key, value in attributes.items():
+        if key in reserved or value is None:
+            continue
+        pairs[f"langfuse.observation.metadata.{key}"] = value if isinstance(value, str) else json.dumps(value, default=str)
+    started = float(payload.get("started") or time.time())
+    ended = float(payload.get("ended") or started)
+    if ended < started:
+        ended = started
+    span: dict[str, Any] = {
+        "traceId": payload["trace_id"],
+        "spanId": payload["span_id"],
+        "name": payload.get("name") or "span",
+        "startTimeUnixNano": str(int(started * 1_000_000_000)),
+        "endTimeUnixNano": str(int(ended * 1_000_000_000)),
+        "attributes": _otel_attributes(pairs),
+        "status": {"code": 2 if payload.get("status") == "ERROR" else 1},
+    }
+    if payload.get("status_message"):
+        span["status"]["message"] = redact_langfuse_text(str(payload["status_message"]))
+    if payload.get("parent_id"):
+        span["parentSpanId"] = payload["parent_id"]
+    events = []
+    for item in payload.get("events") or []:
+        events.append(
             {
-                "id": str(uuid.uuid4()),
-                "type": "event-create",
-                "timestamp": payload["end"],
-                "body": {
-                    "id": uuid.uuid4().hex[:16],
-                    "traceId": span_obj.trace_id,
-                    "parentObservationId": span_obj.span_id,
-                    "name": item.get("name") or "event",
-                    "startTime": payload["end"],
-                    "metadata": item.get("attributes") or {},
-                    "level": "ERROR" if item.get("name") == "error" else "DEFAULT",
-                },
+                "timeUnixNano": span["endTimeUnixNano"],
+                "name": item.get("name") or "event",
+                "attributes": _otel_attributes(item.get("attributes") or {}),
             }
         )
-    return {"batch": batch}
+    if events:
+        span["events"] = events
+    return {
+        "resourceSpans": [
+            {
+                "resource": {"attributes": _otel_attributes({"service.name": SERVICE})},
+                "scopeSpans": [{"scope": {"name": SERVICE}, "spans": [span]}],
+            }
+        ]
+    }
 
 
-def _post_batch(batch: dict) -> None:
-    post_langfuse(langfuse_host() + "/api/public/ingestion", batch, _langfuse_headers())
+def _export_payload(span_obj: _Span, payload: dict) -> dict:
+    exported = dict(payload)
+    exported["trace_id"] = span_obj.trace_id
+    exported["span_id"] = span_obj.span_id
+    exported["parent_id"] = span_obj.parent_id
+    exported["session_id"] = span_obj.session_id
+    exported["name"] = span_obj.name
+    exported["started"] = span_obj.started
+    exported["ended"] = span_obj.ended
+    return exported
+
+
+def _note_ingestion(status: int, ok: bool, errors: list[str]) -> None:
+    global _logged_ingestion_success
+    if ok:
+        if not _logged_ingestion_success:
+            _logged_ingestion_success = True
+            logger.info("Langfuse ingestion accepted a span (HTTP %s)", status)
+        return
+    detail = "; ".join(errors) if errors else "no error body"
+    logger.warning("Langfuse export was rejected (HTTP %s): %s", status, detail)
+
+
+def _post_batch(batch: dict) -> tuple[bool, int, list[str]]:
+    status, body = post_langfuse(
+        langfuse_host() + "/api/public/otel/v1/traces",
+        batch,
+        _auth_headers(otel=True),
+    )
+    ok, errors = langfuse_errors(status, body)
+    _note_ingestion(status, ok, errors)
+    return ok, status, errors
 
 
 def _ensure_worker() -> queue.Queue:
@@ -579,9 +727,125 @@ def _export(span_obj: _Span) -> None:
     except Exception:
         logger.exception("Could not write the local trace")
     try:
-        _schedule_remote(_langfuse_batch(span_obj, payload))
+        _schedule_remote(otel_traces(_export_payload(span_obj, payload)))
     except Exception:
         logger.exception("Could not schedule the Langfuse export")
+
+
+def cached_project_id() -> str | None:
+    host = langfuse_host()
+    public = _flag("LANGFUSE_PUBLIC_KEY")
+    cached = _project_cache
+    if cached and cached[0] == host and cached[1] == public and cached[2]:
+        return cached[2]
+    return None
+
+
+def _remember_project(project_id: str) -> None:
+    global _project_cache
+    _project_cache = (langfuse_host(), _flag("LANGFUSE_PUBLIC_KEY"), project_id)
+
+
+def _project_id_from_body(body: str) -> str | None:
+    try:
+        parsed = json.loads(body) if body else None
+    except json.JSONDecodeError:
+        return None
+    rows = None
+    if isinstance(parsed, dict):
+        rows = parsed.get("data") or parsed.get("projects")
+        if isinstance(parsed.get("id"), str) and not rows:
+            return parsed["id"]
+    elif isinstance(parsed, list):
+        rows = parsed
+    if not isinstance(rows, list) or not rows:
+        return None
+    first = rows[0]
+    if isinstance(first, dict) and isinstance(first.get("id"), str):
+        return first["id"]
+    return None
+
+
+def fetch_project_id() -> tuple[bool, int, str | None, list[str]]:
+    """GET /api/public/projects. Caches the id used in trace links."""
+    if not langfuse_configured():
+        return False, 0, None, ["Langfuse keys are not set"]
+    known = cached_project_id()
+    if known:
+        return True, 200, known, []
+    with _project_lock:
+        known = cached_project_id()
+        if known:
+            return True, 200, known, []
+        status, body = post_langfuse(
+            langfuse_host() + "/api/public/projects",
+            None,
+            _auth_headers(content_type=False),
+            method="GET",
+        )
+        ok, errors = langfuse_errors(status, body)
+        project_id = _project_id_from_body(body) if ok else None
+        if ok and not project_id:
+            ok = False
+            errors = ["Langfuse did not return a project id"]
+        if ok and project_id:
+            _remember_project(project_id)
+            logger.info("Langfuse accepted the keys (HTTP %s, project %s)", status, project_id)
+        elif not ok:
+            logger.warning("Langfuse rejected the keys (HTTP %s): %s", status, "; ".join(errors))
+        return ok, status, project_id, errors
+
+
+def send_test_trace() -> dict:
+    """Post one synthetic span and return Langfuse's status without secrets."""
+    if not langfuse_configured():
+        return {"ok": False, "configured": False, "http_status": None, "errors": ["Langfuse keys are not set"], "trace_id": None, "trace_url": None, "project_id": None}
+    project_ok, project_status, project_id, project_errors = fetch_project_id()
+    now = time.time()
+    trace_id = uuid.uuid4().hex
+    span_payload = {
+        "trace_id": trace_id,
+        "span_id": uuid.uuid4().hex[:16],
+        "parent_id": None,
+        "session_id": "langfuse-connectivity",
+        "name": "langfuse.connectivity",
+        "started": now,
+        "ended": now,
+        "status": "OK",
+        "status_message": "",
+        "attributes": {"text": "AI Recruiter Langfuse connectivity check"},
+        "events": [],
+    }
+    ok, status, errors = _post_batch(otel_traces(span_payload))
+    combined = []
+    if not project_ok:
+        combined.extend(project_errors)
+    if not ok:
+        combined.extend(errors)
+    return {
+        "ok": bool(ok and project_ok),
+        "configured": True,
+        "http_status": status,
+        "project_http_status": project_status,
+        "errors": combined,
+        "trace_id": trace_id,
+        "trace_url": f"{langfuse_host()}/project/{project_id}/traces/{trace_id}" if project_id else None,
+        "project_id": project_id,
+    }
+
+
+def start_background_check() -> None:
+    """Confirm the Langfuse keys once, without blocking process startup."""
+    if not langfuse_configured():
+        return
+
+    def _run() -> None:
+        try:
+            fetch_project_id()
+        except Exception:
+            logger.exception("Langfuse startup check failed")
+
+    threading.Thread(target=_run, name="langfuse-check", daemon=True).start()
 
 
 def score(trace_id: str, name: str, value: bool | float | str, comment: str | None = None, score_id: str | None = None) -> bool:
@@ -607,8 +871,11 @@ def score(trace_id: str, name: str, value: bool | float | str, comment: str | No
     if comment:
         body["comment"] = mask_text(comment)[:1000]
     try:
-        status = post_langfuse(langfuse_host() + "/api/public/scores", body, _langfuse_headers())
-        return 200 <= status < 300
+        status, raw = post_langfuse(langfuse_host() + "/api/public/scores", body, _auth_headers())
+        ok, errors = langfuse_errors(status, raw)
+        if not ok:
+            logger.warning("Langfuse score %s was rejected (HTTP %s): %s", name, status, "; ".join(errors))
+        return ok
     except Exception:
         logger.exception("Could not send Langfuse score %s", name)
         return False

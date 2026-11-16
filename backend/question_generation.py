@@ -70,9 +70,9 @@ ANALYSIS_RESPONSE_FORMAT = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "relevance_score": {"type": "number"},
-                "clarity_score": {"type": "number"},
-                "technical_score": {"type": "number"},
+                "relevance_score": {"type": ["number", "null"]},
+                "clarity_score": {"type": ["number", "null"]},
+                "technical_score": {"type": ["number", "null"]},
                 "key_points": {"type": "string"},
                 "improvement_areas": {"type": "string"},
                 "feedback": {"type": "string"},

@@ -156,7 +156,15 @@ Locally this is `http://localhost:8000`. On Vercel it is the Render origin. Chan
 
 Each interview is one trace. The Langfuse session id is the interview id, and the trace id is that id with the dashes removed, so every later request joins the same trace. A span records the model, the prompt, the reply, token usage, latency, estimated cost, and which structured-output path and retries were used. Spans cover question generation, transcription, scoring, the next question, a follow-up when one is asked, and speech.
 
-Traces are written to `backend/.traces/*.jsonl` whenever tracing is on. They are also sent to Langfuse when `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` are all set. Use the host for the project's region. A missing host, a refused key, or a network error leaves the interview running and keeps the local file. Emails and phone numbers are masked before they are written. Unit tests leave tracing off unless `AI_RECRUITER_TRACES=1`.
+Traces are written to `backend/.traces/*.jsonl` whenever tracing is on. They are sent to Langfuse as OpenTelemetry spans (`POST /api/public/otel/v1/traces`, header `x-langfuse-ingestion-version: 4`) when `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` are all set. Use the host for the project's region. The older `/api/public/ingestion` batch stopped storing traces on 16 November 2026: it still returns HTTP 207 while rejecting each event, and that 207 is logged when the body lists errors. A refused key or a network error leaves the interview running and keeps the local file. Emails and phone numbers are masked before they are written. Unit tests leave tracing off unless `AI_RECRUITER_TRACES=1`.
+
+The report link is `https://<host>/project/<projectId>/traces/<traceId>`. The project id comes from `GET /api/public/projects`. After deploy, confirm the connection:
+
+```bash
+curl -X POST https://ai-recruiter-x7qm.onrender.com/recruiter/langfuse/test
+```
+
+The JSON includes `http_status`, `errors`, and `trace_url`. Open `trace_url`. A span named `langfuse.connectivity` should be on that trace. The API log records the first ingestion status and any later rejection, with Langfuse's message and without the keys. Send the recruiter bearer token when `RECRUITER_AUTH_REQUIRED=true`.
 
 Cost is estimated from token counts. The built-in table prices `openai/gpt-oss-120b` at $0.15 per million input tokens and $0.60 per million output tokens. Replace those rates with `MODEL_PRICES_JSON` when the invoice differs.
 

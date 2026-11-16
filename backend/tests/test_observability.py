@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import json
+
 from sqlalchemy import create_engine, inspect, text
 
 from database import ensure_columns
@@ -68,6 +70,8 @@ class TraceTests(unittest.TestCase):
             else:
                 os.environ[name] = value
         shutil.rmtree(self.folder, ignore_errors=True)
+        observability._project_cache = None
+        observability._logged_ingestion_success = False
 
     def test_tracing_is_off_under_unittest_until_enabled(self):
         os.environ.pop("AI_RECRUITER_TRACES", None)
@@ -113,9 +117,13 @@ class TraceTests(unittest.TestCase):
         os.environ["LANGFUSE_HOST"] = "https://cloud.langfuse.com"
         posts = []
 
-        def fake_post(url, body, headers):
-            posts.append((url, body, headers))
-            return 207
+        def fake_post(url, body, headers, method="POST"):
+            posts.append((url, body, headers, method))
+            if url.endswith("/api/public/projects"):
+                return 200, json.dumps({"data": [{"id": "proj_123", "name": "AI Recruiter"}]})
+            if url.endswith("/api/public/scores"):
+                return 200, "{}"
+            return 200, "{}"
 
         with patch("observability.post_langfuse", side_effect=fake_post):
             with observability.interview("12345678-1234-1234-1234-123456789abc"):
@@ -130,19 +138,70 @@ class TraceTests(unittest.TestCase):
                 note="Quote was not in the answer",
             )
         self.assertTrue(posted)
-        ingestion = [item for item in posts if item[0].endswith("/api/public/ingestion")]
+        ingestion = [item for item in posts if item[0].endswith("/api/public/otel/v1/traces")]
         self.assertTrue(ingestion)
-        batch = ingestion[0][1]["batch"]
-        types = [event["type"] for event in batch]
-        self.assertIn("trace-create", types)
-        self.assertIn("generation-create", types)
-        generation = next(event["body"] for event in batch if event["type"] == "generation-create")
-        self.assertEqual(generation["usage"]["input"], 20)
-        self.assertEqual(generation["usage"]["output"], 10)
-        self.assertEqual(generation["model"], "openai/gpt-oss-120b")
+        self.assertNotIn("/api/public/ingestion", " ".join(item[0] for item in posts))
+        envelope = ingestion[0][1]
+        span = envelope["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+        self.assertEqual(span["traceId"], trace_id_for("12345678-1234-1234-1234-123456789abc"))
+        self.assertEqual(len(span["spanId"]), 16)
+        self.assertRegex(span["startTimeUnixNano"], r"^\d+$")
+        self.assertRegex(span["endTimeUnixNano"], r"^\d+$")
+        attributes = {item["key"]: item["value"] for item in span["attributes"]}
+        self.assertEqual(attributes["langfuse.observation.type"], {"stringValue": "generation"})
+        self.assertEqual(attributes["langfuse.session.id"], {"stringValue": "12345678-1234-1234-1234-123456789abc"})
+        self.assertEqual(attributes["gen_ai.request.model"], {"stringValue": "openai/gpt-oss-120b"})
+        self.assertEqual(attributes["gen_ai.usage.input_tokens"], {"intValue": "20"})
+        self.assertEqual(attributes["gen_ai.usage.output_tokens"], {"intValue": "10"})
+        self.assertEqual(attributes["langfuse.observation.input"], {"stringValue": "hello"})
+        self.assertEqual(attributes["langfuse.observation.output"], {"stringValue": "world"})
+        self.assertNotIn(None, attributes.values())
+        self.assertEqual(ingestion[0][2]["x-langfuse-ingestion-version"], "4")
+        self.assertTrue(ingestion[0][2]["Authorization"].startswith("Basic "))
         scores = [item for item in posts if item[0].endswith("/api/public/scores")]
         self.assertEqual(len(scores), 3)
-        self.assertTrue(ingestion[0][2]["Authorization"].startswith("Basic "))
+
+    def test_partial_success_logs_langfuse_error_without_keys(self):
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-lf-public"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-lf-secret"
+        os.environ["LANGFUSE_HOST"] = "https://cloud.langfuse.com"
+
+        def fake_post(url, body, headers, method="POST"):
+            return 207, json.dumps(
+                {
+                    "errors": [
+                        {
+                            "id": "1",
+                            "status": 400,
+                            "message": "Event type not accepted",
+                            "error": 'Event type "trace-create" is not accepted. sk-lf-secret',
+                        }
+                    ]
+                }
+            )
+
+        with patch("observability.post_langfuse", side_effect=fake_post):
+            with self.assertLogs("observability", level="WARNING") as captured:
+                with observability.span("scoring"):
+                    pass
+        logged = "\n".join(captured.output)
+        self.assertIn("Event type not accepted", logged)
+        self.assertIn("HTTP 207", logged)
+        self.assertNotIn("sk-lf-secret", logged)
+        self.assertNotIn("pk-lf-public", logged)
+
+    def test_trace_url_uses_the_project_traces_path(self):
+        os.environ["LANGFUSE_PUBLIC_KEY"] = "pk-test"
+        os.environ["LANGFUSE_SECRET_KEY"] = "sk-test"
+        os.environ["LANGFUSE_HOST"] = "https://cloud.langfuse.com"
+        observability._remember_project("proj_123")
+        trace_id = "a" * 32
+        self.assertEqual(
+            observability.trace_url(trace_id),
+            "https://cloud.langfuse.com/project/proj_123/traces/" + trace_id,
+        )
+        self.assertNotIn("/trace/" + trace_id, observability.trace_url(trace_id) or "")
+        observability._project_cache = None
 
 
 class SchemaTests(unittest.TestCase):
