@@ -77,6 +77,14 @@ class InterviewSession(Base):
     rubric = Column(JSON, nullable=True)
     dimension_scores = Column(JSON, nullable=True)
     recommendation = Column(Text, nullable=True)
+
+    # One trace for the whole interview, plus the question-generation call.
+    trace_id = Column(String(64), nullable=True)
+    prompt_version = Column(String(64), nullable=True)
+    model = Column(String(80), nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+    cost_usd = Column(Float, nullable=True)
+    fallback_used = Column(String(64), nullable=True)
     
     # Session data
     recording_url = Column(String(512), nullable=True)
@@ -87,6 +95,7 @@ class InterviewSession(Base):
     candidate_resume = relationship("CandidateResume", back_populates="interviews")
     questions = relationship("InterviewQuestion", back_populates="interview_session")
     responses = relationship("CandidateResponse", back_populates="interview_session")
+    feedback_entries = relationship("RecruiterFeedback", back_populates="interview_session")
 
 class InterviewQuestion(Base):
     __tablename__ = 'interview_questions'
@@ -143,10 +152,39 @@ class CandidateResponse(Base):
     improvement_suggestions = Column(Text, nullable=True)
     evidence = Column(Text, nullable=True)
     dimension_scores = Column(JSON, nullable=True)
+
+    # How this score was built. Null on interviews scored before tracing shipped.
+    trace_id = Column(String(64), nullable=True)
+    prompt_version = Column(String(64), nullable=True)
+    model = Column(String(80), nullable=True)
+    latency_ms = Column(Integer, nullable=True)
+    cost_usd = Column(Float, nullable=True)
+    fallback_used = Column(String(64), nullable=True)
     
     # Relationships
     interview_session = relationship("InterviewSession", back_populates="responses")
     question = relationship("InterviewQuestion", back_populates="responses")
+    feedback_entries = relationship("RecruiterFeedback", back_populates="response")
+
+
+class RecruiterFeedback(Base):
+    """One recruiter verdict per answer. Saving again replaces the previous one."""
+
+    __tablename__ = "recruiter_feedback"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    interview_session_id = Column(String(36), ForeignKey("interview_sessions.id"), nullable=False, index=True)
+    response_id = Column(String(36), ForeignKey("candidate_responses.id"), nullable=False, unique=True)
+    vote = Column(String(8), nullable=False)
+    reason = Column(String(64), nullable=True)
+    score_override = Column(Float, nullable=True)
+    note = Column(Text, nullable=True)
+    trace_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    interview_session = relationship("InterviewSession", back_populates="feedback_entries")
+    response = relationship("CandidateResponse", back_populates="feedback_entries")
 
 def init_db(engine):
     """Create tables if they do not exist. Does not load sample interviews."""

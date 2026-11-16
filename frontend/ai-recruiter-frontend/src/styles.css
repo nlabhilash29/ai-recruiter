@@ -486,3 +486,87 @@ textarea { min-height: 96px; resize: vertical; }
   margin: 0;
   color: var(--muted);
 }
+
+.explain {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 14px;
+  background: #f4f9fc;
+  border: 1px solid var(--line);
+}
+
+.explain h2, .explain h4 { margin-bottom: 10px; }
+
+.explain-session { margin-top: 0; }
+
+.explain-reasons { margin-top: 10px; }
+
+.explain-reasons li + li { margin-top: 4px; }
+
+.explain-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px 16px;
+  margin: 12px 0;
+}
+
+.explain-meta div { min-width: 0; }
+
+.explain-meta dt {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.explain-meta dd {
+  margin: 2px 0 0;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.explain-note { margin: 8px 0 0; }
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #e7f4fb;
+  color: var(--blue-deep);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.badge-high, .badge-not_assessed { background: var(--ok-bg); color: var(--ok); }
+.badge-medium { background: var(--warn-bg); color: var(--warn); }
+.badge-low, .badge-warn { background: var(--danger-bg); color: var(--danger); }
+
+.feedback-box {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.feedback-label { margin: 0 0 8px; font-weight: 700; }
+
+.explain .btn { width: auto; }
+
+.explain .btn.is-selected {
+  background: var(--blue-deep);
+  color: white;
+  border-color: var(--blue-deep);
+}
+
+.explain label { margin-top: 10px; }
+
+.explain input, .explain select {
+  margin-top: 6px;
+  margin-bottom: 0;
+}
+
+@media (max-width: 640px) {
+  .explain-meta { grid-template-columns: 1fr 1fr; }
+}

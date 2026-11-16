@@ -8,6 +8,7 @@ from sqlalchemy import or_
 import json
 import logging
 import os
+import time
 import uuid
 import requests
 from datetime import datetime
@@ -15,17 +16,22 @@ from typing import Optional
 
 from file_processing import extract_candidate_info, extract_job_details, process_jd_file, process_resume_file, short_role_title
 from question_generation import (
+    PROMPT_VERSION,
     analyze_response,
     generate_interview_questions,
     generate_next_main_question,
 )
 from rubric import DIMENSION_LABELS, aggregate, infer_role, infer_role_from_documents, rubric_for
+from confidence import assess_confidence
+from feedback_export import feedback_csv
+import observability
 from models import (
     CandidateResponse,
     CandidateResume,
     InterviewQuestion,
     InterviewSession,
     JobDescription,
+    RecruiterFeedback,
 )
 from database import build_session_factory
 from auth import TOKEN_TTL_SECONDS, issue_token, recruiter_auth_required, recruiter_passcode, require_recruiter
@@ -88,6 +94,28 @@ class LoginBody(BaseModel):
     passcode: str
 
 
+class FeedbackBody(BaseModel):
+    vote: str
+    reason: Optional[str] = None
+    score_override: Optional[float] = None
+    note: Optional[str] = None
+
+
+FEEDBACK_REASONS = {
+    "score_too_high",
+    "score_too_low",
+    "evidence_not_in_answer",
+    "bad_question",
+    "transcription_error",
+    "other",
+}
+FALLBACK_LABELS = {
+    "scoring_unavailable": "Scoring unavailable",
+    "thin_analysis": "Thin answer",
+    "default_questions": "Default questions",
+}
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -103,7 +131,13 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "observability": {
+            "traces": observability.tracing_enabled(),
+            "langfuse": observability.langfuse_configured(),
+        },
+    }
 
 
 @app.post("/recruiter/login")
@@ -188,6 +222,42 @@ def _recommendation(overall):
     return "Requires further evaluation"
 
 
+def _latest_feedback(interview: InterviewSession) -> dict:
+    latest = {}
+    entries = list(getattr(interview, "feedback_entries", None) or [])
+    entries.sort(key=lambda row: (row.created_at or datetime.min, row.id or ""))
+    for row in entries:
+        latest[row.response_id] = row
+    return latest
+
+
+def _feedback_payload(row: Optional[RecruiterFeedback]) -> Optional[dict]:
+    if row is None:
+        return None
+    return {
+        "vote": row.vote,
+        "reason": row.reason,
+        "score_override": row.score_override,
+        "note": row.note,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _apply_generation_meta(interview: InterviewSession, summary: Optional[dict]) -> None:
+    interview.trace_id = interview.trace_id or observability.trace_id_for(interview.id)
+    interview.prompt_version = interview.prompt_version or PROMPT_VERSION
+    if not summary:
+        return
+    if summary.get("model"):
+        interview.model = summary["model"]
+    if summary.get("latency_ms"):
+        interview.latency_ms = int(interview.latency_ms or 0) + int(summary["latency_ms"])
+    if isinstance(summary.get("cost_usd"), (int, float)):
+        interview.cost_usd = round(float(interview.cost_usd or 0) + float(summary["cost_usd"]), 6)
+    if summary.get("fallback_used"):
+        interview.fallback_used = summary["fallback_used"]
+
+
 def build_report(interview: InterviewSession, include_documents: bool = True) -> dict:
     questions = _ordered_questions(interview)
     questions_with_responses = []
@@ -200,11 +270,20 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
     clarity_values = []
     cultural_values = []
 
+    feedback_by_response = _latest_feedback(interview)
     for question in questions:
         responses = []
         for response in question.responses:
+            feedback = _feedback_payload(feedback_by_response.get(response.id))
+            confidence = assess_confidence(
+                response.response_text,
+                response.evidence,
+                response.dimension_scores,
+                response.fallback_used,
+            )
             responses.append(
                 {
+                    "id": response.id,
                     "response_text": response.response_text,
                     "score": response.score,
                     "timestamp": response.timestamp.isoformat() if response.timestamp else None,
@@ -213,6 +292,15 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
                     "clarity_score": response.clarity_score,
                     "improvement_suggestions": response.improvement_suggestions or "",
                     "keywords_matched": response.keywords_matched,
+                    "trace_id": response.trace_id,
+                    "model": response.model,
+                    "latency_ms": response.latency_ms,
+                    "cost_usd": response.cost_usd,
+                    "fallback_used": response.fallback_used,
+                    "fallback_label": FALLBACK_LABELS.get(response.fallback_used or "", None),
+                    "prompt_version": response.prompt_version,
+                    "confidence": confidence,
+                    "feedback": feedback,
                 }
             )
             if response.score is not None and response.score >= 8 and (response.ai_feedback or "").strip():
@@ -268,7 +356,9 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
     plan = interview.rubric or rubric_for(role)
     if per_answer_scores:
         rolled = aggregate(per_answer_scores, role)
-        overall = rolled["overall"] if rolled["overall"] is not None else interview.overall_score
+        overall = rolled["overall"]
+        if overall is None and interview.overall_score:
+            overall = interview.overall_score
         recommendation = rolled["recommendation"]
         dimension_scores = rolled["dimensions"]
         legacy = False
@@ -342,6 +432,17 @@ def build_report(interview: InterviewSession, include_documents: bool = True) ->
             ),
         },
         "questions": questions_with_responses,
+        "observability": {
+            "trace_id": interview.trace_id,
+            "trace_url": observability.trace_url(interview.trace_id),
+            "prompt_version": interview.prompt_version,
+            "model": interview.model,
+            "latency_ms": interview.latency_ms,
+            "cost_usd": interview.cost_usd,
+            "fallback_used": interview.fallback_used,
+            "fallback_label": FALLBACK_LABELS.get(interview.fallback_used or "", None),
+            "langfuse": observability.langfuse_configured(),
+        },
         "interview_summary": {
             "strengths": strengths,
             "areas_for_improvement": improvements,
@@ -702,14 +803,18 @@ async def create_interview_session(
         )
         db.add(interview_session)
         db.flush()
-        first = await generate_next_main_question(
-            job_description.content,
-            candidate_resume.content,
-            [],
-            1,
-            plan["role_family"],
-            [],
-        )
+        with observability.interview(session_id):
+            interview_session.trace_id = observability.trace_id_for(session_id)
+            interview_session.prompt_version = PROMPT_VERSION
+            first = await generate_next_main_question(
+                job_description.content,
+                candidate_resume.content,
+                [],
+                1,
+                plan["role_family"],
+                [],
+            )
+            _apply_generation_meta(interview_session, observability.recall("question.next"))
         questions = _store_questions(db, session_id, [first])
         db.commit()
         return {
@@ -751,6 +856,92 @@ async def get_interview_details(
     except Exception as exc:
         logger.error("Error getting interview details: %s", exc)
         raise HTTPException(status_code=500, detail="The interview report could not be loaded.")
+
+
+def _clean_feedback(body: FeedbackBody) -> dict:
+    vote = (body.vote or "").strip().lower()
+    if vote not in {"up", "down"}:
+        raise HTTPException(status_code=400, detail="Vote must be up or down.")
+    reason = (body.reason or "").strip() or None
+    if reason and reason not in FEEDBACK_REASONS:
+        raise HTTPException(status_code=400, detail="Choose a reason from the list.")
+    override = body.score_override
+    if override is not None:
+        try:
+            override = float(override)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Score override must be between 1 and 10.") from None
+        if override < 1 or override > 10:
+            raise HTTPException(status_code=400, detail="Score override must be between 1 and 10.")
+    note = " ".join((body.note or "").split()) or None
+    if note:
+        note = note[:500]
+    return {"vote": vote, "reason": reason, "score_override": override, "note": note}
+
+
+@app.post("/interview/{interview_id}/responses/{response_id}/feedback")
+async def save_score_feedback(
+    interview_id: str,
+    response_id: str,
+    body: FeedbackBody,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_recruiter),
+):
+    """Store a recruiter verdict and, when Langfuse is configured, score the trace."""
+    interview = _get_interview_or_404(db, interview_id)
+    response = (
+        db.query(CandidateResponse)
+        .filter(
+            CandidateResponse.id == response_id,
+            CandidateResponse.interview_session_id == interview.id,
+        )
+        .first()
+    )
+    if response is None:
+        raise HTTPException(status_code=404, detail="Answer not found")
+    cleaned = _clean_feedback(body)
+    row = db.query(RecruiterFeedback).filter(RecruiterFeedback.response_id == response.id).first()
+    if row is None:
+        row = RecruiterFeedback(
+            interview_session_id=interview.id,
+            response_id=response.id,
+        )
+        db.add(row)
+    row.vote = cleaned["vote"]
+    row.reason = cleaned["reason"]
+    row.score_override = cleaned["score_override"]
+    row.note = cleaned["note"]
+    row.trace_id = response.trace_id or interview.trace_id
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(row)
+    posted = False
+    try:
+        posted = observability.record_recruiter_feedback(
+            row.trace_id,
+            response_id=response.id,
+            vote=row.vote,
+            reason=row.reason,
+            score_override=row.score_override,
+            note=row.note,
+        )
+    except Exception:
+        logger.exception("Langfuse score was not recorded")
+        posted = False
+    return {"feedback": _feedback_payload(row), "langfuse_score": posted}
+
+
+@app.get("/recruiter/feedback.csv")
+async def export_recruiter_feedback(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_recruiter),
+):
+    payload = feedback_csv(db)
+    return StreamingResponse(
+        iter([payload.encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=recruiter-feedback.csv"},
+    )
 
 
 @app.get("/interview/{interview_id}/results")
@@ -802,7 +993,8 @@ async def speak_current_question(interview_id: str, db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail="Interview is already completed")
     if not view["ready"]:
         raise HTTPException(status_code=400, detail="This interview is not ready yet.")
-    audio_output = text_to_speech(view["current_question"]["question_text"])
+    with observability.interview(interview_id):
+        audio_output = text_to_speech(view["current_question"]["question_text"])
     return StreamingResponse(iter([audio_output]), media_type="audio/mpeg")
 
 
@@ -1007,14 +1199,18 @@ async def create_mock_interview(
         )
         db.add(interview_session)
         db.flush()
-        first = await generate_next_main_question(
-            jd_content,
-            mock_resume.content,
-            [],
-            1,
-            plan["role_family"],
-            [],
-        )
+        with observability.interview(session_id):
+            interview_session.trace_id = observability.trace_id_for(session_id)
+            interview_session.prompt_version = PROMPT_VERSION
+            first = await generate_next_main_question(
+                jd_content,
+                mock_resume.content,
+                [],
+                1,
+                plan["role_family"],
+                [],
+            )
+            _apply_generation_meta(interview_session, observability.recall("question.next"))
         questions = _store_questions(db, session_id, [first])
         db.commit()
         return {
@@ -1165,7 +1361,7 @@ async def delete_interview_question(
     return {"deleted": question_id, "total_questions": interview.main_question_target}
 
 
-def _store_answer(response: CandidateResponse, analysis: dict) -> None:
+def _store_answer(response: CandidateResponse, analysis: dict, interview: InterviewSession) -> None:
     response.score = analysis.get("relevance_score")
     response.technical_accuracy = analysis.get("technical_score")
     response.clarity_score = analysis.get("clarity_score")
@@ -1173,6 +1369,13 @@ def _store_answer(response: CandidateResponse, analysis: dict) -> None:
     response.improvement_suggestions = analysis.get("improvement_areas") or ""
     response.evidence = analysis.get("evidence") or ""
     response.dimension_scores = analysis.get("dimension_scores") or {}
+    obs = analysis.get("observability") if isinstance(analysis.get("observability"), dict) else {}
+    response.trace_id = interview.trace_id or observability.trace_id_for(interview.id)
+    response.model = obs.get("model")
+    response.latency_ms = obs.get("latency_ms")
+    response.cost_usd = obs.get("cost_usd")
+    response.fallback_used = analysis.get("fallback_used") or None
+    response.prompt_version = analysis.get("prompt_version") or PROMPT_VERSION
 
 
 @app.post("/talk-video")
@@ -1183,8 +1386,15 @@ async def process_video(
     db: Session = Depends(get_db),
 ):
     """Transcribe the candidate's audio, score it, and speak the next question."""
+    trace_cm = None
     try:
         interview_session = _get_interview_or_404(db, interview_id)
+        trace_cm = observability.interview(interview_session.id)
+        trace_cm.__enter__()
+        if not interview_session.trace_id:
+            interview_session.trace_id = observability.trace_id_for(interview_session.id)
+        if not interview_session.prompt_version:
+            interview_session.prompt_version = PROMPT_VERSION
         silent = _form_flag(no_speech)
         if silent:
             user_message = "The candidate did not speak."
@@ -1247,7 +1457,7 @@ async def process_video(
             no_speech=silent,
             job_text=job.content if job else "",
         )
-        _store_answer(response, analysis)
+        _store_answer(response, analysis, interview_session)
         db.flush()
 
         mode = interview_session.question_mode or "preset"
@@ -1284,6 +1494,7 @@ async def process_video(
                     interview_session.role_family or "general",
                     covered,
                 )
+                _apply_generation_meta(interview_session, observability.recall("question.next"))
                 sequence = max(question.sequence_number or 0 for question in all_questions) + 1
                 _append_question(
                     db,
@@ -1335,6 +1546,12 @@ async def process_video(
         db.rollback()
         logger.error("Error processing video: %s", exc)
         raise HTTPException(status_code=500, detail="The answer could not be processed. Please try again.")
+    finally:
+        if trace_cm is not None:
+            try:
+                trace_cm.__exit__(None, None, None)
+            except Exception:
+                logger.exception("Could not close the interview trace")
 
 
 @app.get("/interview/check-completed")
@@ -1436,6 +1653,23 @@ def audio_media_type(extension: str) -> str:
 
 
 async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", content_type: str = "") -> str:
+    started = time.perf_counter()
+    with observability.span("transcription", model="stub" if ai_stub_enabled() else "whisper-1") as current:
+        current.set(stub=ai_stub_enabled(), audio_bytes=len(content or b""))
+        try:
+            text = await _transcribe_audio_bytes(content, filename, content_type)
+        except Exception:
+            current.set(latency_ms=int(round((time.perf_counter() - started) * 1000)))
+            raise
+        current.set(
+            transcript=text,
+            characters=len(text or ""),
+            latency_ms=int(round((time.perf_counter() - started) * 1000)),
+        )
+        return text
+
+
+async def _transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", content_type: str = "") -> str:
     if ai_stub_enabled():
         return (
             "I led the work to build an AI interview product. I broke the problem into transcription, "
@@ -1493,6 +1727,20 @@ async def transcribe_audio_bytes(content: bytes, filename: str = "answer.webm", 
 
 
 def text_to_speech(text: str) -> bytes:
+    started = time.perf_counter()
+    model = "stub" if ai_stub_enabled() else ELEVENLABS_MODEL_ID
+    with observability.span("tts", model=model) as current:
+        current.set(stub=ai_stub_enabled(), characters=len(text or ""), text=text or "")
+        try:
+            audio = _text_to_speech(text)
+        except Exception:
+            current.set(latency_ms=int(round((time.perf_counter() - started) * 1000)))
+            raise
+        current.set(audio_bytes=len(audio or b""), latency_ms=int(round((time.perf_counter() - started) * 1000)))
+        return audio
+
+
+def _text_to_speech(text: str) -> bytes:
     if ai_stub_enabled():
         return SILENT_MP3
     if not ELEVENLABS_API_KEY:

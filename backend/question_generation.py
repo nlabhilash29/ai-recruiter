@@ -1,10 +1,12 @@
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+import observability
 from rubric import (
     DIMENSIONS,
     clean_dimension_scores,
@@ -19,6 +21,9 @@ from settings import GROQ_API_KEY, GROQ_MODEL, GROQ_REASONING_EFFORT, ai_stub_en
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Bump when the scoring or question prompts change in a way a trace should name.
+PROMPT_VERSION = "rubric-v1"
 
 _client = None
 
@@ -180,6 +185,33 @@ def _message_text(message) -> str:
     return str(content).strip()
 
 
+def _format_name(fmt: Optional[dict]) -> str:
+    if not fmt:
+        return "text"
+    kind = fmt.get("type") or "text"
+    if kind == "json_schema":
+        return "json_schema"
+    if kind == "json_object":
+        return "json_object"
+    return str(kind)
+
+
+def _usage_counts(response) -> Dict[str, Optional[int]]:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"input": None, "output": None, "total": None}
+    if isinstance(usage, dict):
+        source = usage
+        input_tokens = source.get("prompt_tokens", source.get("input"))
+        output_tokens = source.get("completion_tokens", source.get("output"))
+        total_tokens = source.get("total_tokens", source.get("total"))
+    else:
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+    return {"input": input_tokens, "output": output_tokens, "total": total_tokens}
+
+
 def complete_chat(
     messages: List[Dict[str, str]],
     *,
@@ -191,6 +223,8 @@ def complete_chat(
 
     gpt-oss spends completion budget on reasoning, so a short cap can come
     back with an empty answer. Empty completions are retried.
+    Each attempt is its own LLM span: model, prompt, reply, tokens, latency,
+    and which structured-output path was used.
     """
     client = get_client()
     formats: List[Optional[dict]] = []
@@ -199,9 +233,12 @@ def complete_chat(
         if response_format.get("type") == "json_schema":
             formats.append({"type": "json_object"})
     formats.append(None)
+    preferred = _format_name(response_format) if response_format else "text"
 
     last_error: Optional[Exception] = None
+    attempt = 0
     for fmt in formats:
+        path = _format_name(fmt)
         payloads = []
         base = {
             "model": GROQ_MODEL,
@@ -225,16 +262,62 @@ def complete_chat(
         payloads.append(legacy)
 
         for payload in payloads:
+            attempt += 1
+            started = time.perf_counter()
             try:
-                response = client.chat.completions.create(**payload)
-                text = _message_text(response.choices[0].message)
-                if text:
-                    return text
-                last_error = ValueError("Model returned an empty completion")
-                logger.warning("Empty completion from %s", GROQ_MODEL)
+                with observability.span(
+                    "llm.chat",
+                    model=GROQ_MODEL,
+                    format_path=path,
+                    attempt=attempt,
+                    prompt_version=PROMPT_VERSION,
+                ) as current:
+                    current.set(prompt=messages, reasoning_effort=payload.get("reasoning_effort") or "omitted")
+                    response = client.chat.completions.create(**payload)
+                    latency_ms = int(round((time.perf_counter() - started) * 1000))
+                    text = _message_text(response.choices[0].message)
+                    usage = _usage_counts(response)
+                    cost = observability.estimate_cost(GROQ_MODEL, usage.get("input"), usage.get("output"))
+                    current.set(
+                        reply=text,
+                        latency_ms=latency_ms,
+                        cost_usd=cost,
+                        input_tokens=usage.get("input"),
+                        output_tokens=usage.get("output"),
+                        total_tokens=usage.get("total"),
+                        ok=bool(text),
+                    )
+                    if response_format and path != preferred:
+                        current.event("fallback", kind="structured_output", path=path, attempt=attempt)
+                    if not text:
+                        current.event("error", kind="empty_completion", detail="model returned an empty completion")
+                    observability.remember_llm(
+                        {
+                            "model": GROQ_MODEL,
+                            "latency_ms": latency_ms,
+                            "cost_usd": cost,
+                            "ok": bool(text),
+                            "format_path": path,
+                            "attempt": attempt,
+                        }
+                    )
+                    if text:
+                        return text
+                    last_error = ValueError("Model returned an empty completion")
+                    logger.warning("Empty completion from %s", GROQ_MODEL)
             except Exception as exc:
                 last_error = exc
                 logger.warning("Groq completion attempt failed: %s", exc)
+                observability.remember_llm(
+                    {
+                        "model": GROQ_MODEL,
+                        "latency_ms": int(round((time.perf_counter() - started) * 1000)),
+                        "cost_usd": None,
+                        "ok": False,
+                        "format_path": path,
+                        "attempt": attempt,
+                    }
+                )
     if last_error:
         raise last_error
     raise ValueError("Model returned an empty completion")
@@ -473,6 +556,46 @@ def _thin_analysis() -> Dict[str, Any]:
     analysis["dimension_scores"] = {key: None for key in DIMENSIONS}
     analysis["evidence"] = ""
     analysis["not_assessed"] = True
+    analysis["fallback_used"] = "thin_analysis"
+    return analysis
+
+
+def _scoring_unavailable_analysis() -> Dict[str, Any]:
+    """Explicit not-assessed state. Never invent 5/5/5 when scoring fails."""
+    analysis = finalize_analysis(
+        {
+            "relevance_score": None,
+            "clarity_score": None,
+            "technical_score": None,
+            "key_points": "",
+            "improvement_areas": "Review the transcript. Automatic scoring did not return a score.",
+            "feedback": "Not assessed — scoring unavailable.",
+        }
+    )
+    analysis["relevance_score"] = None
+    analysis["clarity_score"] = None
+    analysis["technical_score"] = None
+    analysis["dimension_scores"] = {key: None for key in DIMENSIONS}
+    analysis["evidence"] = ""
+    analysis["not_assessed"] = True
+    analysis["fallback_used"] = "scoring_unavailable"
+    return analysis
+
+
+def _with_observability(analysis: Dict[str, Any], mark: int, *, stub: bool = False) -> Dict[str, Any]:
+    try:
+        summary = observability.summarize_llm(
+            observability.llm_since(mark),
+            stub=stub,
+            prompt_version=PROMPT_VERSION,
+        )
+        if analysis.get("fallback_used"):
+            summary["fallback_used"] = analysis["fallback_used"]
+        analysis["observability"] = summary
+        analysis["prompt_version"] = PROMPT_VERSION
+    except Exception:
+        logger.exception("Could not attach score observability")
+        analysis.setdefault("prompt_version", PROMPT_VERSION)
     return analysis
 
 
@@ -514,12 +637,27 @@ async def analyze_response(
     job_text: str = "",
 ) -> Dict[str, Any]:
     """Score an answer and always return feedback plus improvement text."""
+    mark = observability.llm_mark()
+    with observability.span("scoring", dimension=dimension or "", role_family=role_family):
+        return _analyze_response(question, response, role_family, dimension, no_speech, job_text, mark)
+
+
+def _analyze_response(
+    question: str,
+    response: str,
+    role_family: str,
+    dimension: str | None,
+    no_speech: bool,
+    job_text: str,
+    mark: int,
+) -> Dict[str, Any]:
     if no_speech or not (response or "").strip() or response.strip().lower().startswith("the candidate did not speak"):
-        return _unscored_analysis()
+        return _with_observability(_unscored_analysis(), mark)
     if lacks_substance(response):
-        return _thin_analysis()
+        observability.note_fallback("thin_analysis", "answer has too little content to score")
+        return _with_observability(_thin_analysis(), mark)
     if ai_stub_enabled():
-        return _stub_analysis(role_family)
+        return _with_observability(_stub_analysis(role_family), mark, stub=True)
     plan = rubric_for(role_family)
     focus = dimension or "the dimension this question was meant to test"
     try:
@@ -591,22 +729,11 @@ Response: {response}
                     analysis["improvement_areas"] = retry.get("improvement_areas", "")
             except Exception as retry_error:
                 logger.error("Feedback retry failed: %s", retry_error)
-        return _attach_dimensions(finalize_analysis(analysis), role_family)
+        return _with_observability(_attach_dimensions(finalize_analysis(analysis), role_family), mark)
     except Exception as exc:
         logger.error("Error analyzing response: %s", exc)
-        return _attach_dimensions(
-            finalize_analysis(
-                {
-                    "relevance_score": 5,
-                    "clarity_score": 5,
-                    "technical_score": 5,
-                    "key_points": "",
-                    "improvement_areas": "",
-                    "feedback": "",
-                }
-            ),
-            role_family,
-        )
+        observability.note_fallback("scoring_unavailable", exc.__class__.__name__)
+        return _with_observability(_scoring_unavailable_analysis(), mark)
 
 
 def _questions_from_payload(payload: dict) -> List[Dict[str, Any]]:
@@ -718,6 +845,12 @@ async def generate_interview_questions(jd_content: str, resume_content: str) -> 
     plan = _plan_from_documents(jd_content, resume_content)
     if ai_stub_enabled():
         return get_default_questions(plan["role_label"], resume_content)
+    mark = observability.llm_mark()
+    with observability.span("question.generate"):
+        return _generate_interview_questions(jd_content, resume_content, plan, mark)
+
+
+def _generate_interview_questions(jd_content: str, resume_content: str, plan: Dict[str, Any], mark: int) -> List[Dict[str, Any]]:
     try:
         prompt = f"""Given the job description and resume below, generate EXACTLY 5 interview questions.
 First plan 5 distinct focus areas, each mapped to a different requirement in the job description: strategy, execution, stakeholders, metrics, and a domain skill.
@@ -764,17 +897,32 @@ Resume:
                     questions = parse_generated_questions(raw)
                 if len(questions) == 5 and all(validate_question(q) for q in questions):
                     logger.info("Successfully generated 5 valid questions")
-                    return _polish_question_set(questions, jd_content, resume_content)
+                    polished = _polish_question_set(questions, jd_content, resume_content)
+                    _remember_questions(mark, None)
+                    return polished
                 logger.warning("Attempt %s: generated %s questions, retrying...", attempt + 1, len(questions))
             except Exception as exc:
                 logger.error("Attempt %s failed: %s", attempt + 1, exc)
                 if attempt == max_attempts - 1:
                     raise
         logger.warning("Could not generate valid questions, using defaults")
+        observability.note_fallback("default_questions", "question generation did not return 5 valid questions")
+        _remember_questions(mark, "default_questions")
         return get_default_questions(plan["role_label"], resume_content)
     except Exception as exc:
         logger.error("Error in question generation: %s", exc)
+        observability.note_fallback("default_questions", exc.__class__.__name__)
+        _remember_questions(mark, "default_questions")
         return get_default_questions(plan["role_label"], resume_content)
+
+
+def _remember_questions(mark: int, fallback_used: Optional[str]) -> None:
+    summary = observability.summarize_llm(
+        observability.llm_since(mark),
+        prompt_version=PROMPT_VERSION,
+    )
+    summary["fallback_used"] = fallback_used
+    observability.remember("question.generate", summary)
 
 
 def validate_question(question: Dict[str, Any]) -> bool:
@@ -1195,31 +1343,32 @@ async def maybe_follow_up_question(question: str, answer: str, analysis: Dict[st
     reason = follow_up_reason(answer, analysis)
     if not reason:
         return None
-    if ai_stub_enabled() or not GROQ_API_KEY:
-        return _fallback_follow_up(reason)
-    try:
-        raw = complete_chat(
-            [
-                {
-                    "role": "system",
-                    "content": "You ask one short follow-up interview question. Return only the question.",
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"The answer was {reason}. Ask one follow-up that stays on the same topic.\n"
-                        f"Question: {question}\nAnswer: {answer}"
-                    ),
-                },
-            ],
-            max_completion_tokens=200,
-            temperature=0.4,
-        )
-        text = (raw or "").strip().strip('"')
-        return text if text.endswith("?") else _fallback_follow_up(reason)
-    except Exception as exc:
-        logger.error("Follow-up generation failed: %s", exc)
-        return _fallback_follow_up(reason)
+    with observability.span("question.follow_up", reason=reason):
+        if ai_stub_enabled() or not GROQ_API_KEY:
+            return _fallback_follow_up(reason)
+        try:
+            raw = complete_chat(
+                [
+                    {
+                        "role": "system",
+                        "content": "You ask one short follow-up interview question. Return only the question.",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"The answer was {reason}. Ask one follow-up that stays on the same topic.\n"
+                            f"Question: {question}\nAnswer: {answer}"
+                        ),
+                    },
+                ],
+                max_completion_tokens=200,
+                temperature=0.4,
+            )
+            text = (raw or "").strip().strip('"')
+            return text if text.endswith("?") else _fallback_follow_up(reason)
+        except Exception as exc:
+            logger.error("Follow-up generation failed: %s", exc)
+            return _fallback_follow_up(reason)
 
 
 async def generate_next_main_question(
@@ -1235,7 +1384,36 @@ async def generate_next_main_question(
     plan = rubric_for(role_family)
     priors = [str(item.get("question") or "").strip() for item in history if str(item.get("question") or "").strip()]
     shaped = fallback_question(plan["role_label"], dimension, main_index, resume_content, priors)
+    mark = observability.llm_mark()
+    with observability.span("question.next", main_index=main_index, dimension=dimension):
+        return _generate_next_main_question(
+            jd_content,
+            resume_content,
+            history,
+            main_index,
+            dimension,
+            plan,
+            priors,
+            shaped,
+            mark,
+        )
+
+
+def _generate_next_main_question(
+    jd_content: str,
+    resume_content: str,
+    history: List[Dict[str, str]],
+    main_index: int,
+    dimension: str,
+    plan: Dict[str, Any],
+    priors: List[str],
+    shaped: Dict[str, Any],
+    mark: int,
+) -> Dict[str, Any]:
+    fallback_used = None
     if ai_stub_enabled() or not GROQ_API_KEY:
+        summary = observability.summarize_llm([], stub=True, prompt_version=PROMPT_VERSION)
+        observability.remember("question.next", summary)
         return shaped
     prior = "\n".join(
         f"Q: {item.get('question', '')}\nA: {item.get('answer', '')}" for item in history
@@ -1288,6 +1466,8 @@ async def generate_next_main_question(
         chosen = questions[0] if questions else dict(shaped)
     except Exception as exc:
         logger.error("Next question generation failed: %s", exc)
+        fallback_used = "default_questions"
+        observability.note_fallback("default_questions", exc.__class__.__name__)
         chosen = dict(shaped)
     chosen = dict(chosen)
     chosen["question_text"] = shape_question_text(
@@ -1305,6 +1485,9 @@ async def generate_next_main_question(
     chosen["assesses"] = chosen.get("assesses") or dimension
     chosen["key_points"] = chosen.get("key_points") or shaped["key_points"]
     chosen["main_index"] = main_index
+    summary = observability.summarize_llm(observability.llm_since(mark), prompt_version=PROMPT_VERSION)
+    summary["fallback_used"] = fallback_used
+    observability.remember("question.next", summary)
     return chosen
 
 

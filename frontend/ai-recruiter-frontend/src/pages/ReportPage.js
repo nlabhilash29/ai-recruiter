@@ -35,7 +35,7 @@ export default function ReportPage() {
       </Link>
       {error ? <div className="alert alert-error">{error}</div> : null}
       {!report && !error ? <p className="card">Loading the report…</p> : null}
-      {report ? <ResultsView report={report} /> : null}
+      {report ? <ResultsView report={report} explain /> : null}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { formatScore } from "../api";
+import ScoreExplain from "./ScoreExplain";
 
 function ScoreBar({ value }) {
   const label = formatScore(value);
@@ -32,10 +33,23 @@ function anchorText(anchors, score) {
   return anchors[points[0]] || anchors[String(points[0])] || "";
 }
 
+function formatTraceCost(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const number = Number(value);
+  if (Number.isNaN(number)) return "—";
+  if (number === 0) return "$0";
+  return `$${number.toFixed(4)}`;
+}
+
+function formatTraceLatency(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  return `${value} ms`;
+}
+
 const LEGACY_NOTE =
   "Each answer is scored out of 10. The number on a question is how relevant that answer was. The overall score averages technical accuracy and communication (clarity) across all answers, and it is also out of 10. Because those are different measures, one question can sit above or below the overall score.";
 
-export default function ResultsView({ report }) {
+export default function ResultsView({ report, explain = false }) {
   const scoring = report.scoring || {};
   const summary = report.interview_summary || {};
   const strengths = (summary.strengths || []).map((item) => String(item || "").trim()).filter(Boolean);
@@ -120,6 +134,53 @@ export default function ResultsView({ report }) {
         )}
       </article>
 
+      {explain && report.observability ? (
+        <aside className="explain explain-session">
+          <h2>Interview trace</h2>
+          <div className="chip-row">
+            {report.observability.fallback_label ? (
+              <span className="badge badge-warn">Fallback · {report.observability.fallback_label}</span>
+            ) : report.observability.model === "stub" ? (
+              <span className="badge badge-high">Stubbed questions</span>
+            ) : report.observability.model ? (
+              <span className="badge badge-high">Questions generated</span>
+            ) : (
+              <span className="badge">Trace not stored</span>
+            )}
+            {report.observability.prompt_version ? (
+              <span className="badge">{report.observability.prompt_version}</span>
+            ) : null}
+          </div>
+          <dl className="explain-meta">
+            <div>
+              <dt>Trace</dt>
+              <dd>{report.observability.trace_id || "Not stored for this interview"}</dd>
+            </div>
+            <div>
+              <dt>Question model</dt>
+              <dd>{report.observability.model || "Not recorded"}</dd>
+            </div>
+            <div>
+              <dt>Question latency</dt>
+              <dd>{formatTraceLatency(report.observability.latency_ms)}</dd>
+            </div>
+            <div>
+              <dt>Question cost</dt>
+              <dd>{formatTraceCost(report.observability.cost_usd)}</dd>
+            </div>
+          </dl>
+          {report.observability.trace_url ? (
+            <a className="plain-link" href={report.observability.trace_url} target="_blank" rel="noreferrer">
+              Open this interview in Langfuse
+            </a>
+          ) : (
+            <p className="muted explain-note">
+              A Langfuse link appears here when LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST are set.
+            </p>
+          )}
+        </aside>
+      ) : null}
+
       {(report.questions || []).map((question, index) => (
         <article className="question-card" key={question.id || index}>
           <header className="question-card-head">
@@ -171,6 +232,13 @@ export default function ResultsView({ report }) {
                     <h4>What to improve</h4>
                     <p>{improve}</p>
                   </>
+                ) : null}
+                {explain ? (
+                  <ScoreExplain
+                    interviewId={report.interview_id}
+                    response={response}
+                    traceUrl={report.observability?.trace_url}
+                  />
                 ) : null}
               </div>
             );
