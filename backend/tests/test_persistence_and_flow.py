@@ -190,6 +190,41 @@ class InterviewFlowTests(unittest.TestCase):
         filtered = self.client.get("/interview/search", headers=headers, params={"status": "completed"})
         self.assertTrue(filtered.json())
 
+    def test_interview_with_no_assessable_answers_is_not_assessed_not_zero(self):
+        created = self.client.post(
+            "/mock-interview",
+            data={
+                "candidate_name": "Sam Silent",
+                "jd_text": "Job Title: Customer Success Manager\nCompany: Example\nKeep customers successful.",
+                "resume_text": "Sam Silent\nsam@example.com\nCustomer success manager.",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        interview_id = created.json()["interview_id"]
+        for _ in range(5):
+            answer = self.client.post("/talk-video", data={"interview_id": interview_id, "no_speech": "true"})
+            self.assertEqual(answer.status_code, 200, answer.text)
+
+        from main import SessionLocal
+
+        db = SessionLocal()
+        try:
+            stored = db.query(InterviewSession).filter(InterviewSession.id == interview_id).one()
+            self.assertEqual(stored.status, "completed")
+            self.assertIsNone(stored.overall_score)
+            self.assertIsNone(stored.technical_score)
+            self.assertIsNone(stored.communication_score)
+            self.assertIsNone(stored.cultural_fit_score)
+            self.assertTrue(stored.recommendation.startswith("Not enough evidence"))
+        finally:
+            db.close()
+
+        scoring = self.client.get(f"/interview/{interview_id}/results").json()["scoring"]
+        self.assertIsNone(scoring["overall_score"])
+        listing = self.client.get("/interview/search", params={"q": "Sam Silent"}).json()
+        item = next(entry for entry in listing if entry["interview_id"] == interview_id)
+        self.assertIsNone(item["overall_score"])
+
     def test_recruiter_can_create_a_real_interview_the_candidate_cannot_report(self):
         login = self.client.post("/recruiter/login", json={"passcode": "smoke-pass"})
         headers = {"Authorization": f"Bearer {login.json()['token']}"}

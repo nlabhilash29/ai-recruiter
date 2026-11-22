@@ -61,7 +61,7 @@ class FeedbackTests(unittest.TestCase):
         interview_id, body, response = self._answered_interview()
         self.assertEqual(response["model"], "stub")
         self.assertEqual(response["cost_usd"], 0)
-        self.assertEqual(response["prompt_version"], "rubric-v1")
+        self.assertEqual(response["prompt_version"], "rubric-v1.1")
         self.assertIsNone(response["fallback_used"])
         self.assertEqual(response["confidence"]["level"], "high")
         self.assertTrue(response["confidence"]["checks"]["evidence_in_transcript"])
