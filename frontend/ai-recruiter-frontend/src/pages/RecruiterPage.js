@@ -258,7 +258,7 @@ export default function RecruiterPage() {
               <li key={interview.interview_id}>
                 <div>
                   <strong>{title}</strong>
-                  {score ? <p className="muted">{score}/10</p> : null}
+                  <p className="muted">{score ? `${score}/10` : "Not assessed"}</p>
                 </div>
                 <div className="controls">
                   <Link className="btn btn-secondary" to={`/recruiter/interviews/${interview.interview_id}`}>

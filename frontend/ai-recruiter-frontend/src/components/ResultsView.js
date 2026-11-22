@@ -74,8 +74,8 @@ export default function ResultsView({ report, explain = false }) {
         <p className="lede">{summary.overall_recommendation || "Results"}</p>
         <div className="overall-score">
           <p className="overall-number">
-            <span>{overall || "—"}</span>
-            <small>/10</small>
+            <span>{overall || "Not assessed"}</span>
+            {overall ? <small>/10</small> : null}
           </p>
           <div>
             <p className="overall-label">Overall score</p>

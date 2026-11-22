@@ -1258,10 +1258,11 @@ def _finish_scores(db: Session, interview_session: InterviewSession) -> None:
         dims = rolled["dimensions"]
         interview_session.dimension_scores = dims
         interview_session.recommendation = rolled["recommendation"]
-        interview_session.overall_score = rolled["overall"] if rolled["overall"] is not None else 0
-        interview_session.technical_score = dims.get("role_knowledge") or 0
-        interview_session.communication_score = dims.get("communication") or 0
-        interview_session.cultural_fit_score = dims.get("collaboration") or 0
+        # None means "not assessed". Storing 0 made an interview with no assessable answers read as 0.0/10.
+        interview_session.overall_score = rolled["overall"]
+        interview_session.technical_score = dims.get("role_knowledge")
+        interview_session.communication_score = dims.get("communication")
+        interview_session.cultural_fit_score = dims.get("collaboration")
         return
     scored = [response for response in responses if response.technical_accuracy is not None or response.clarity_score is not None]
     pool = scored or responses

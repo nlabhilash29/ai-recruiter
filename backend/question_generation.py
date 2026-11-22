@@ -23,7 +23,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Bump when the scoring or question prompts change in a way a trace should name.
-PROMPT_VERSION = "rubric-v1"
+PROMPT_VERSION = "rubric-v1.1"
 
 _client = None
 
@@ -76,7 +76,7 @@ ANALYSIS_RESPONSE_FORMAT = {
                 "key_points": {"type": "string"},
                 "improvement_areas": {"type": "string"},
                 "feedback": {"type": "string"},
-                "evidence": {"type": "string"},
+                "evidence": {"type": ["string", "null"]},
                 "dimension_scores": {
                     "type": "object",
                     "additionalProperties": False,
@@ -461,6 +461,11 @@ def finalize_analysis(analysis: Dict[str, Any]) -> Dict[str, Any]:
         result["improvement_areas"] = (
             "Add a specific example from your experience and describe the result."
         )
+    # Keep the model's per-dimension scores and evidence. Dropping them here meant ownership and
+    # collaboration were never saved, "not assessable" became 5/5/5, and evidence became key_points.
+    for key in ("dimension_scores", "evidence", "not_assessed"):
+        if key in analysis:
+            result[key] = analysis[key]
     return result
 
 
@@ -602,6 +607,9 @@ def _with_observability(analysis: Dict[str, Any], mark: int, *, stub: bool = Fal
 def _attach_dimensions(analysis: Dict[str, Any], role_family: str) -> Dict[str, Any]:
     raw = analysis.get("dimension_scores") if isinstance(analysis.get("dimension_scores"), dict) else {}
     scores = clean_dimension_scores(raw)
+    # The model returned the dimensions and left every one null: that is its "not assessable" verdict.
+    if any(key in raw for key in DIMENSIONS) and all(raw.get(key) is None for key in DIMENSIONS):
+        analysis["not_assessed"] = True
     # A dimension the model left null stays unassessed. Do not copy a filler score onto it.
     legacy = {
         "communication": analysis.get("clarity_score"),
@@ -617,6 +625,9 @@ def _attach_dimensions(analysis: Dict[str, Any], role_family: str) -> Dict[str, 
             scores[key] = round(float(value), 1)
     if analysis.get("not_assessed"):
         scores = {key: None for key in DIMENSIONS}
+        analysis["relevance_score"] = None
+        analysis["clarity_score"] = None
+        analysis["technical_score"] = None
     analysis["dimension_scores"] = scores
     if not analysis.get("not_assessed"):
         overall = weighted_overall(scores, role_family)
@@ -624,7 +635,8 @@ def _attach_dimensions(analysis: Dict[str, Any], role_family: str) -> Dict[str, 
             analysis["relevance_score"] = overall
         analysis["clarity_score"] = scores.get("communication")
         analysis["technical_score"] = scores.get("role_knowledge")
-    analysis["evidence"] = (analysis.get("evidence") or analysis.get("key_points") or "").strip()
+    # Evidence is a quote from the answer. key_points is a summary, so it is not a substitute.
+    analysis["evidence"] = _meaningful(analysis.get("evidence"))
     return analysis
 
 
@@ -668,7 +680,7 @@ A product manager, salesperson, or other non-engineering candidate is not marked
 If a dimension has no evidence in the answer, set it to null. Do not guess, and do not use 5 as a placeholder.
 If the answer is only a few words, off-topic, or has no real example (for example "This is a test response. Let's move on."), set every dimension_scores value to null and say in feedback that there was not enough content to assess. Do not assign numeric scores.
 Scores are 1 to 10 only when the transcript supports them. Anchors live at 2, 4, 6, 8, and 10.
-evidence is a short quote or close paraphrase from the answer that justifies the scores.
+evidence is a short verbatim quote copied from the answer that justifies the scores (empty string if nothing does).
 feedback is 2-3 sentences on what worked and what to add, and must be non-empty.
 improvement_areas is concrete advice, and must be non-empty.
 relevance_score is the weighted overall of the dimensions you could score.
